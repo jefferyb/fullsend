@@ -256,6 +256,19 @@ func provisionOwnRoles(ctx context.Context, cfg RoleProvisionConfig, reg gitlabr
 			}
 			present[secret] = true
 			result.Enrolled = append(result.Enrolled, rec.Name)
+			// Record rotation-state proof of this administrator-provided
+			// enrollment, mirroring the freshly-minted-PAT path below, so
+			// a later RotateGitLabRoleCredentials run does not treat this
+			// healthy provided credential as an unproven orphan and
+			// immediately re-mint a replacement for it. There is no
+			// GitLab token ID to record here (only the secret value was
+			// supplied); tokenID=0 with phase=idle and DistributedAt set
+			// is the same not-due proof rotateProvided records for a
+			// later administrator-provided replacement.
+			if err := recordInitialDistribution(ctx, cfg.Client, cfg.Owner, cfg.Repo, rec.Name, 0, "", now); err != nil {
+				result.Diagnostics = append(result.Diagnostics, fmt.Sprintf(
+					"%s: recording rotation-state distribution proof failed; a future rotation run will treat this credential as unproven and replace it", rec.Name))
+			}
 			continue
 		}
 		if cfg.DryRun {

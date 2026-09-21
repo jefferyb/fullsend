@@ -416,6 +416,16 @@ a role rotation failed. The shared token remains available only through
 the explicit migration/rollback gate. Runtime 401/403 of a selected
 role credential is still `ErrAuthFailed`.
 
+**Administrator-provided replacement does not auto-revoke leftovers.**
+`--gitlab-role-token` (free-tier enrollment or a custom `own`
+credential) stores the supplied value directly. Its own GitLab token ID
+cannot be resolved from the value alone, so it cannot be excluded from
+the same-named project access tokens GitLab already lists — recording
+all of them for grace revocation risks revoking the just-enrolled
+replacement itself. Enrolling a replacement this way therefore does not
+schedule any other active same-named PAT for revocation; if one exists,
+confirm it is not the replacement and revoke it manually.
+
 **Identity continuity.** GitLab assigns a new bot user per PAT, so the
 GitLab user ID changes on replacement. Fullsend preserves the role
 name, token name (`fullsend-poller`, `fullsend-role-<name>`), CI

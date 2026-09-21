@@ -244,22 +244,23 @@ func rotateOneRole(ctx context.Context, cfg RoleRotateConfig, rec gitlabroles.Re
 	}
 
 	if !cfg.DryRun {
-		rs.Holder = holder
-		rs.LockUntil = now.Add(lockTTL).Format(time.RFC3339)
-		// Claim via mergeRoleState (re-read immediately before writing)
-		// instead of writeRotationState of the state snapshot loaded
-		// above, so a sibling role's concurrent update landing between
-		// that load and this write is not silently reverted. Passing
-		// holder (not empty) here lets mergeRoleState's own
-		// otherHoldsRotationLock check reject this claim against the
-		// freshly re-read document when a different, still-valid holder
-		// already owns the lock -- including one that claimed and
-		// advanced this same role (e.g. to distributing/overlapping)
-		// after this holder's own pre-claim read above. Without that
-		// check, this write would persist this holder's stale pre-claim
-		// snapshot on top of that in-progress or completed state and
-		// steal the lock.
-		if err := mergeRoleState(ctx, cfg.Client, cfg.Owner, cfg.Repo, rec.Name, holder, now, rs, &state); err != nil {
+		lockUntil := now.Add(lockTTL).Format(time.RFC3339)
+		// Claim via claimRoleRotationLock (re-read immediately before
+		// writing) instead of writeRotationState of the state snapshot
+		// loaded above, so a sibling role's concurrent update landing
+		// between that load and this write is not silently reverted.
+		// claimRoleRotationLock copies only Holder/LockUntil onto the
+		// freshly re-read role entry -- it never overwrites phase,
+		// incoming_id, outgoing_ids, or distributed_at with this
+		// holder's own (possibly stale) pre-claim snapshot in rs. That
+		// matters even when the lock is free: a process that loaded an
+		// unlocked document, stalled through a concurrent winner's full
+		// mint/distribute/lock-release, and only now claims must not
+		// revert that winner's completed state to a fresh idle entry,
+		// which would make distributionProven false below and cause a
+		// redundant mint. A different, still-valid holder currently
+		// owning the lock still rejects the claim outright.
+		if err := claimRoleRotationLock(ctx, cfg.Client, cfg.Owner, cfg.Repo, rec.Name, holder, lockUntil, now, &state); err != nil {
 			if errors.Is(err, errRotationLockLost) {
 				result.InProgress = append(result.InProgress, rec.Name)
 				result.Diagnostics = append(result.Diagnostics, fmt.Sprintf("%s: concurrent rotation won the lock; skipping", rec.Name))
@@ -336,7 +337,15 @@ func rotateOneRole(ctx context.Context, cfg RoleRotateConfig, rec gitlabroles.Re
 	// that distributed the current live token: IncomingID matches it and
 	// DistributedAt is set. Otherwise proceed so the recovery path below
 	// can run.
-	distributionProven := rs.IncomingID != 0 && rs.IncomingID == current.ID && rs.DistributedAt != ""
+	// Administrator-provided enrollment (rotateProvided, and the mirrored
+	// proof recorded by provisionOwnRoles) has no GitLab token ID to put
+	// in IncomingID, since only the secret value is supplied -- it
+	// proves distribution by writing phase=idle with DistributedAt set
+	// and IncomingID left at zero. Do not extend this to phase=failed: a
+	// failed administrator-provided enrollment must still be retried.
+	providedDistributionProven := rs.IncomingID == 0 && rs.Phase == rotationPhaseIdle && rs.DistributedAt != ""
+	distributionProven := (rs.IncomingID != 0 && rs.IncomingID == current.ID && rs.DistributedAt != "") ||
+		providedDistributionProven
 	needsRecovery := rs.IncomingID != 0 && (rs.Phase == rotationPhaseDistributing || rs.Phase == rotationPhaseFailed)
 	alreadyFresh := !cfg.Force && current.ID != 0 && current.Active && current.ExpiresAt == freshExpiry &&
 		distributionProven && !needsRecovery
@@ -541,8 +550,19 @@ func rotateProvided(ctx context.Context, cfg RoleRotateConfig, rec gitlabroles.R
 	rs.ExpiresAt = ""
 	rs.Error = ""
 	result.Rotated = append(result.Rotated, rec.Name)
-	result.Diagnostics = append(result.Diagnostics, fmt.Sprintf(
-		"%s: enrolled administrator-provided replacement (%s); previous credentials remain during the grace period", rec.Name, secret))
+	// Do not imply that grace cleanup will retire any other active
+	// same-named PAT: OutgoingIDs is nil above (its own ID cannot be
+	// resolved to exclude it), so cleanupOutgoing has nothing to act on
+	// and will never revoke a leftover automatically. Surface that as an
+	// explicit manual action instead.
+	if leftover := activeIDsExcept(matches, 0); len(leftover) > 0 {
+		result.Diagnostics = append(result.Diagnostics, fmt.Sprintf(
+			"%s: enrolled administrator-provided replacement (%s); %d other active project access token(s) sharing this role's token name were not scheduled for automatic revocation because the replacement's own GitLab token ID is unknown -- confirm they are not the just-enrolled replacement and revoke them manually if so",
+			rec.Name, secret, len(leftover)))
+	} else {
+		result.Diagnostics = append(result.Diagnostics, fmt.Sprintf(
+			"%s: enrolled administrator-provided replacement (%s)", rec.Name, secret))
+	}
 }
 
 func cleanupOutgoing(ctx context.Context, cfg RoleRotateConfig, rs *rotationRoleState, now time.Time, grace time.Duration, listed *[]ProjectAccessToken) bool {
@@ -656,25 +676,70 @@ func writeRotationState(ctx context.Context, client forge.Client, owner, repo st
 	return client.UpdateCIVariable(ctx, owner, repo, forge.VarGitLabRoleRotation, string(raw), true)
 }
 
+// claimRoleRotationLock re-reads the rotation-state document immediately
+// before writing, then persists this holder's lock claim onto that
+// freshly read role entry by overwriting only Holder and LockUntil. It
+// never replaces phase, incoming_id, outgoing_ids, or distributed_at
+// with this holder's own (possibly stale) pre-claim snapshot: a process
+// that loaded an unlocked document, stalled through a concurrent
+// winner's complete mint/distribute/lock-release, and only now claims
+// must not revert that winner's completed state to a fresh idle entry --
+// doing so would make distributionProven false for the freshly claimed
+// role and cause a redundant mint.
+//
+// The claim is rejected with errRotationLockLost, and nothing is
+// written, if the freshly read document shows a different, still-valid
+// holder currently owns the lock.
+//
+// Like mergeRoleState, this fails closed: if the rotation-state document
+// cannot be re-read, the claim is not attempted and the read error is
+// returned rather than writing over an uninitialized document.
+func claimRoleRotationLock(ctx context.Context, client forge.Client, owner, repo string, role gitlabroles.Role, holder, lockUntil string, now time.Time, state *rotationStateFile) error {
+	fresh, _, err := loadRotationState(ctx, client, owner, repo)
+	if err != nil {
+		return fmt.Errorf("re-reading rotation state before lock claim: %w", err)
+	}
+	*state = fresh
+	if state.Roles == nil {
+		state.Roles = map[string]rotationRoleState{}
+	}
+	cur := state.Roles[string(role)]
+	if otherHoldsRotationLock(cur, holder, now) {
+		return errRotationLockLost
+	}
+	cur.Holder = holder
+	cur.LockUntil = lockUntil
+	state.Roles[string(role)] = cur
+	return writeRotationState(ctx, client, owner, repo, *state)
+}
+
 // mergeRoleState re-reads the rotation-state document immediately before
 // writing rs for role, so this write does not silently discard a sibling
 // role's concurrent update that landed after *state was last loaded in
 // this call. *state is updated in place (to the freshly read document,
 // with role's entry set to rs) so later reads in the same call see the
-// merged result. A read failure falls back to *state as-is rather than
-// blocking this role's own outcome from being recorded.
+// merged result. If the re-read fails, nothing is written and the error
+// is returned: an uninitialized or stale *state is never treated as a
+// safe fallback, since writeRotationState persists the whole multi-role
+// document and a fail-open write on a transient read failure would
+// clobber every other role's lock, incoming_id, and outgoing_ids.
 //
 // When holder is non-empty, the write aborts with errRotationLockLost if
 // the freshly read document shows role's lock now held by a different,
 // still-valid holder: a concurrent process has since reclaimed the lock
 // (for example, this holder's lockTTL lapsed mid-rotation), and this
 // write must not clobber that process's state. Pass an empty holder to
-// skip this check, which is only correct for the initial lock claim,
-// before this holder owns the lock at all.
+// skip this check; this is only correct for recordInitialDistribution,
+// which writes proof for a role that is not under this rotation lock at
+// all (initial provisioning happens outside RotateGitLabRoleCredentials).
+// The rotation lock claim itself uses claimRoleRotationLock, not
+// mergeRoleState, and always passes a non-empty holder.
 func mergeRoleState(ctx context.Context, client forge.Client, owner, repo string, role gitlabroles.Role, holder string, now time.Time, rs rotationRoleState, state *rotationStateFile) error {
-	if fresh, _, err := loadRotationState(ctx, client, owner, repo); err == nil {
-		*state = fresh
+	fresh, _, err := loadRotationState(ctx, client, owner, repo)
+	if err != nil {
+		return fmt.Errorf("re-reading rotation state before write: %w", err)
 	}
+	*state = fresh
 	if state.Roles == nil {
 		state.Roles = map[string]rotationRoleState{}
 	}

@@ -391,6 +391,17 @@ func TestProvisionGitLabRoleCredentials_ProvidedTokenEnrolled(t *testing.T) {
 	for _, d := range result.Diagnostics {
 		assertNoLeak(t, d)
 	}
+	// A later RotateGitLabRoleCredentials run must see rotation-state
+	// proof of this enrollment (phase=idle, DistributedAt set, no GitLab
+	// token ID to record) so it does not immediately treat this healthy
+	// administrator-provided credential as an unproven orphan and
+	// re-mint a replacement for it.
+	raw := fc.VariableValues["group/project/"+forge.VarGitLabRoleRotation]
+	// The poller entry must go straight from phase to distributed_at with
+	// no incoming_id in between: recordInitialDistribution is called
+	// with tokenID=0, which the omitempty tag drops entirely, unlike the
+	// freshly-minted analyst/coder roles in this same document.
+	assert.Contains(t, raw, `"poller":{"phase":"idle","distributed_at":`)
 }
 
 func TestProvisionGitLabRoleCredentials_ProvidedTokenUnregisteredRole(t *testing.T) {
