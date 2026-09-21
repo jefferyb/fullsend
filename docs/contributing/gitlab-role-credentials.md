@@ -388,11 +388,15 @@ Hold these four code invariants and the documentation-terminology rule
 below when changing `internal/gitlabroles`, GitLab credential handling
 in `internal/cli`, or the remaining rollout stages
 ([#7500](https://github.com/fullsend-ai/fullsend/issues/7500),
-[#7501](https://github.com/fullsend-ai/fullsend/issues/7501)). They are
-the review findings from [PR #7510](https://github.com/fullsend-ai/fullsend/pull/7510)
-(stage 3 routing). A later change that selects, stores, or hands a
-GitLab role credential to a child process can reintroduce any of them.
-Extend the helpers named below rather than adding a parallel path.
+[#7501](https://github.com/fullsend-ai/fullsend/issues/7501)). The four
+code invariants are the review findings from
+[PR #7510](https://github.com/fullsend-ai/fullsend/pull/7510) (stage 3
+routing); a later change that selects, stores, or hands a GitLab role
+credential to a child process can reintroduce any of those four. The
+documentation-terminology rule comes from
+[#7513](https://github.com/fullsend-ai/fullsend/issues/7513), keeping
+fallback wording consistent across docs rather than fixing a routing
+bug. Extend the helpers named below rather than adding a parallel path.
 
 ### Check the authenticating token, not a role label
 
