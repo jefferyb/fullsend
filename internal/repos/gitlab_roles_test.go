@@ -152,6 +152,16 @@ func TestProvisionGitLabRoleCredentials_FreshBuiltins(t *testing.T) {
 	assert.Equal(t, "migrating", fc.VariableValues["group/project/"+forge.VarGitLabRoleMigration])
 	assert.Equal(t, `{"roles":[]}`, fc.VariableValues["group/project/"+forge.VarGitLabRoleRegistry])
 
+	// Initial provisioning must record rotation-state proof of
+	// distribution, so a later RotateGitLabRoleCredentials run does not
+	// treat these healthy, just-created PATs as unproven orphans and
+	// immediately mint replacements for them.
+	rotationRaw := fc.VariableValues["group/project/"+forge.VarGitLabRoleRotation]
+	for _, name := range []string{"poller", "analyst", "coder"} {
+		assert.Contains(t, rotationRaw, fmt.Sprintf(`"%s":{`, name))
+	}
+	assert.Contains(t, rotationRaw, `"distributed_at":"2026-01-02T00:00:00Z"`)
+
 	for _, rec := range fc.CreatedSecrets {
 		assertNoLeak(t, rec.Name)
 	}

@@ -102,10 +102,19 @@ func TestRotateGitLabRoleCredentials_CustomOwnAndReuse(t *testing.T) {
 	require.NoError(t, err)
 	fc := seededRoleClient(t, gitlabroles.RolePoller, gitlabroles.RoleAnalyst, gitlabroles.RoleCoder, gitlabroles.Role("scanner"))
 	tokens := &fakeTokens{}
-	tokens.seed(ProjectAccessToken{Name: gitlabroles.PollerTokenName, Active: true, ExpiresAt: "2027-09-21"})
-	tokens.seed(ProjectAccessToken{Name: gitlabroles.AnalystTokenName, Active: true, ExpiresAt: "2027-09-21"})
-	tokens.seed(ProjectAccessToken{Name: gitlabroles.CoderTokenName, Active: true, ExpiresAt: "2027-09-21"})
+	tokens.seed(ProjectAccessToken{ID: 1, Name: gitlabroles.PollerTokenName, Active: true, ExpiresAt: "2027-09-21"})
+	tokens.seed(ProjectAccessToken{ID: 2, Name: gitlabroles.AnalystTokenName, Active: true, ExpiresAt: "2027-09-21"})
+	tokens.seed(ProjectAccessToken{ID: 3, Name: gitlabroles.CoderTokenName, Active: true, ExpiresAt: "2027-09-21"})
 	tokens.seed(ProjectAccessToken{Name: gitlabroles.CustomTokenName("scanner"), Active: true, ExpiresAt: "2026-10-01"})
+	// poller/analyst/coder are already healthy and distributed (as a real
+	// prior rotation or initial provisioning would have recorded): give
+	// them rotation-state proof so they are correctly treated as not due,
+	// rather than as unproven live tokens that must be replaced.
+	require.NoError(t, fc.UpdateCIVariable(context.Background(), "group", "project", forge.VarGitLabRoleRotation, `{"roles":{
+		"poller":{"phase":"idle","incoming_id":1,"distributed_at":"2026-06-01T00:00:00Z"},
+		"analyst":{"phase":"idle","incoming_id":2,"distributed_at":"2026-06-01T00:00:00Z"},
+		"coder":{"phase":"idle","incoming_id":3,"distributed_at":"2026-06-01T00:00:00Z"}
+	}}`, true))
 
 	result, err := RotateGitLabRoleCredentials(context.Background(), RoleRotateConfig{
 		Owner:    "group",
@@ -532,6 +541,66 @@ func TestRotateGitLabRoleCredentials_ConcurrentSiblingRoleSurvives(t *testing.T)
 	assert.Equal(t, "2026-09-20T00:00:00Z", analyst.DistributedAt)
 }
 
+// siblingReadInjector simulates a concurrent process writing a sibling
+// role's rotation state into the shared FULLSEND_GITLAB_ROLE_ROTATION
+// document immediately after this process's first read of it
+// (loadRotationState, before the lock-claim write persists anything).
+// This is the narrower window TestRotateGitLabRoleCredentials_
+// ConcurrentSiblingRoleSurvives does not cover: that test only injects
+// after this process's first write, whereas the lock-claim write itself
+// used to persist the snapshot loaded before the injected sibling write
+// landed, reverting it.
+type siblingReadInjector struct {
+	*forge.FakeClient
+	injected bool
+}
+
+func (c *siblingReadInjector) GetRepoVariable(ctx context.Context, owner, repo, name string) (string, bool, error) {
+	raw, exists, err := c.FakeClient.GetRepoVariable(ctx, owner, repo, name)
+	if name != forge.VarGitLabRoleRotation || c.injected {
+		return raw, exists, err
+	}
+	c.injected = true
+	file, _, loadErr := loadRotationState(ctx, c.FakeClient, owner, repo)
+	if loadErr == nil {
+		file.Roles[string(gitlabroles.RoleAnalyst)] = rotationRoleState{
+			Phase: rotationPhaseIdle, IncomingID: 42, DistributedAt: "2026-09-20T00:00:00Z",
+		}
+		_ = writeRotationState(ctx, c.FakeClient, owner, repo, file)
+	}
+	return raw, exists, err
+}
+
+func TestRotateGitLabRoleCredentials_ConcurrentSiblingRoleSurvivesLockClaim(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 9, 21, 12, 0, 0, 0, time.UTC)
+	inner := seededRoleClient(t, gitlabroles.RolePoller, gitlabroles.RoleAnalyst)
+	fc := &siblingReadInjector{FakeClient: inner}
+	tokens := &fakeTokens{}
+	tokens.seed(ProjectAccessToken{Name: gitlabroles.PollerTokenName, Active: true, ExpiresAt: "2026-10-01"})
+
+	result, err := RotateGitLabRoleCredentials(context.Background(), RoleRotateConfig{
+		Owner:    "group",
+		Repo:     "project",
+		Client:   fc,
+		Tokens:   tokens,
+		Registry: gitlabroles.BuiltinRegistry(),
+		Mode:     gitlabroles.ModeMigrating,
+		Roles:    []gitlabroles.Role{gitlabroles.RolePoller},
+		Now:      now,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []gitlabroles.Role{gitlabroles.RolePoller}, result.Rotated)
+	require.True(t, fc.injected, "the sibling write must have landed for this test to be meaningful")
+
+	final, _, err := loadRotationState(context.Background(), inner, "group", "project")
+	require.NoError(t, err)
+	analyst, ok := final.Roles[string(gitlabroles.RoleAnalyst)]
+	require.True(t, ok, "a sibling role's concurrent update landing before the lock-claim write must survive")
+	assert.Equal(t, 42, analyst.IncomingID)
+	assert.Equal(t, "2026-09-20T00:00:00Z", analyst.DistributedAt)
+}
+
 func TestRotateGitLabRoleCredentials_InProgressLock(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, 9, 21, 12, 0, 0, 0, time.UTC)
@@ -731,6 +800,9 @@ func TestRotateGitLabRoleCredentials_RecoveryAfterPartialDistributionWithoutForc
 	require.NoError(t, err)
 	assert.NotContains(t, result.Skipped, gitlabroles.RolePoller,
 		"an incomplete distributing phase must reach recovery even on the default auto-rotate (non-Force) path")
+	assert.Equal(t, []gitlabroles.Role{gitlabroles.RolePoller}, result.Rotated,
+		"recovery must actually mint and distribute a replacement, not merely avoid Skipped")
+	require.Len(t, tokens.created, 1, "recovery must mint exactly one replacement token")
 	assert.NotContains(t, tokens.revoked, 8, "incoming PAT may already be the live distributed credential")
 	assert.NotContains(t, tokens.revoked, 7, "last known-good PAT stays until grace cleanup")
 }
@@ -766,4 +838,45 @@ func TestRotateGitLabRoleCredentials_OrphanBeforeFirstStateWriteIsNotTrustedAsDu
 	raw := fc.VariableValues["group/project/"+forge.VarGitLabRoleRotation]
 	assert.Contains(t, raw, fmt.Sprintf(`"incoming_id":%d`, tokens.created[0].ID))
 	assert.Contains(t, raw, "\"outgoing_ids\":[7,8]", "both the old distributed token and the orphan must be tracked for grace cleanup")
+}
+
+// TestRotateGitLabRoleCredentials_SingleUnprovenOrphanIsNotTrustedAsDue
+// covers the narrower crash window than
+// TestRotateGitLabRoleCredentials_OrphanBeforeFirstStateWriteIsNotTrustedAsDue:
+// here only the crash-created orphan token exists (no second live PAT,
+// and no prior rotation state at all), which used to make the old
+// needsProof gate stay false (no overlap, no distributing/failed phase)
+// and let the single fresh-looking PAT slip through as "already
+// rotated" / "not due" without any proof this process (or provisioning)
+// ever distributed it.
+func TestRotateGitLabRoleCredentials_SingleUnprovenOrphanIsNotTrustedAsDue(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 9, 21, 12, 0, 0, 0, time.UTC)
+	fc := seededRoleClient(t, gitlabroles.RolePoller)
+	tokens := &fakeTokens{}
+	// A single active same-named PAT, freshly minted "today" as if
+	// CreateProjectAccessToken succeeded moments before the process
+	// crashed and never wrote phase=distributing. No rotation state
+	// exists at all for this role (first run for this document).
+	tokens.seed(ProjectAccessToken{ID: 9, Name: gitlabroles.PollerTokenName, Active: true, ExpiresAt: GitLabPATExpiresAt(now)})
+
+	result, err := RotateGitLabRoleCredentials(context.Background(), RoleRotateConfig{
+		Owner:    "group",
+		Repo:     "project",
+		Client:   fc,
+		Tokens:   tokens,
+		Registry: gitlabroles.BuiltinRegistry(),
+		Mode:     gitlabroles.ModeMigrating,
+		Roles:    []gitlabroles.Role{gitlabroles.RolePoller},
+		Now:      now,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []gitlabroles.Role{gitlabroles.RolePoller}, result.Rotated,
+		"a single unproven same-named PAT must not be trusted as evidence rotation already succeeded")
+	assert.NotContains(t, result.Skipped, gitlabroles.RolePoller)
+	require.Len(t, tokens.created, 1)
+	assert.NotContains(t, tokens.revoked, 9, "the orphan stays valid for in-flight jobs until grace cleanup")
+	raw := fc.VariableValues["group/project/"+forge.VarGitLabRoleRotation]
+	assert.Contains(t, raw, fmt.Sprintf(`"incoming_id":%d`, tokens.created[0].ID))
+	assert.Contains(t, raw, "\"outgoing_ids\":[9]", "the orphan must be tracked for grace cleanup")
 }

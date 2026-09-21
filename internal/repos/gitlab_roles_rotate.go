@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -15,6 +16,11 @@ import (
 )
 
 var roleRotateLocks sync.Map // owner/repo/role -> *sync.Mutex
+
+// errRotationLockLost is returned by mergeRoleState when a concurrent
+// process has reclaimed a role's rotation lock since this holder last
+// verified it owns the lock.
+var errRotationLockLost = errors.New("gitlab role rotation lock lost to a concurrent claim")
 
 const (
 	rotationPhaseIdle         = "idle"
@@ -240,8 +246,14 @@ func rotateOneRole(ctx context.Context, cfg RoleRotateConfig, rec gitlabroles.Re
 	if !cfg.DryRun {
 		rs.Holder = holder
 		rs.LockUntil = now.Add(lockTTL).Format(time.RFC3339)
-		state.Roles[string(rec.Name)] = rs
-		if err := writeRotationState(ctx, cfg.Client, cfg.Owner, cfg.Repo, state); err != nil {
+		// Claim via mergeRoleState (re-read immediately before writing)
+		// instead of writeRotationState of the state snapshot loaded
+		// above, so a sibling role's concurrent update landing between
+		// that load and this write is not silently reverted. The
+		// ownership check inside mergeRoleState is skipped here (empty
+		// holder) since this holder does not own the lock yet; the
+		// read-back verify below detects a concurrent winner.
+		if err := mergeRoleState(ctx, cfg.Client, cfg.Owner, cfg.Repo, rec.Name, "", now, rs, &state); err != nil {
 			result.Failed = append(result.Failed, RoleProvisionFailure{
 				Role: rec.Name, Secret: secret, Reason: "writing rotation lock failed",
 			})
@@ -293,7 +305,7 @@ func rotateOneRole(ctx context.Context, cfg RoleRotateConfig, rec gitlabroles.Re
 		cleaned := cleanupOutgoing(ctx, cfg, &rs, now, grace, listed)
 		if cleaned {
 			result.Cleaned = append(result.Cleaned, rec.Name)
-			_ = mergeRoleState(ctx, cfg.Client, cfg.Owner, cfg.Repo, rec.Name, rs, &state)
+			_ = mergeRoleState(ctx, cfg.Client, cfg.Owner, cfg.Repo, rec.Name, holder, now, rs, &state)
 			matches = tokensNamed(*listed, tokenName)
 			current = currentListed(matches)
 		}
@@ -301,23 +313,22 @@ func rotateOneRole(ctx context.Context, cfg RoleRotateConfig, rec gitlabroles.Re
 
 	rr := roleReportFrom(ctx, cfg, rec, matches, now, lead)
 	freshExpiry := GitLabPATExpiresAt(now)
-	// A single active same-named PAT is unambiguous: its own expiry
-	// tells us whether it is due. But once more than one active
-	// same-named PAT exists (rr.Overlapping) or the state says a
-	// distribution was left incomplete, the live inventory alone cannot
-	// tell a legitimate post-rotation overlap apart from an unrecorded
-	// orphan token — one left behind by a crash before the distributing
-	// phase was even written, or one still mid-distribution. In that
-	// ambiguous case, only trust "not due" when the rotation state
-	// itself proves this process is the one that distributed the
-	// current live token (IncomingID matches it and DistributedAt is
-	// set); otherwise proceed so the recovery path below can run.
-	needsProof := rr.Overlapping || rs.Phase == rotationPhaseOverlapping ||
-		(rs.IncomingID != 0 && (rs.Phase == rotationPhaseDistributing || rs.Phase == rotationPhaseFailed))
+	// The live inventory alone can never distinguish a legitimately
+	// distributed credential from an unrecorded orphan: one left behind
+	// by a crash before any rotation-state write landed (including the
+	// single-active-PAT case — that lone token may be an orphan minted
+	// moments before a crash wiped out the write that would have
+	// recorded it), one still mid-distribution, or one left over from an
+	// overlapping/failed attempt. Only trust "already rotated" or "not
+	// due" when the rotation state itself proves this process (or
+	// initial provisioning, which also records this proof) is the one
+	// that distributed the current live token: IncomingID matches it and
+	// DistributedAt is set. Otherwise proceed so the recovery path below
+	// can run.
 	distributionProven := rs.IncomingID != 0 && rs.IncomingID == current.ID && rs.DistributedAt != ""
 	needsRecovery := rs.IncomingID != 0 && (rs.Phase == rotationPhaseDistributing || rs.Phase == rotationPhaseFailed)
 	alreadyFresh := !cfg.Force && current.ID != 0 && current.Active && current.ExpiresAt == freshExpiry &&
-		(!needsProof || distributionProven) && !needsRecovery
+		distributionProven && !needsRecovery
 	if alreadyFresh || (recentlyDistributed(rs, now) && !gitlabroles.RoleDueForRotation(rr)) {
 		result.Skipped = append(result.Skipped, rec.Name)
 		result.Diagnostics = append(result.Diagnostics, fmt.Sprintf("%s: already rotated (idempotent)", rec.Name))
@@ -326,7 +337,7 @@ func rotateOneRole(ctx context.Context, cfg RoleRotateConfig, rec gitlabroles.Re
 		}
 		return
 	}
-	if !cfg.Force && !gitlabroles.RoleDueForRotation(rr) && (!needsProof || distributionProven) && !needsRecovery {
+	if !cfg.Force && !gitlabroles.RoleDueForRotation(rr) && distributionProven && !needsRecovery {
 		result.Skipped = append(result.Skipped, rec.Name)
 		if rr.Overlapping || rs.Phase == rotationPhaseOverlapping {
 			result.Overlapping = append(result.Overlapping, rec.Name)
@@ -337,7 +348,7 @@ func rotateOneRole(ctx context.Context, cfg RoleRotateConfig, rec gitlabroles.Re
 	if provided := strings.TrimSpace(cfg.ProvidedTokens[rec.Name]); provided != "" {
 		rotateProvided(ctx, cfg, rec, secret, provided, now, matches, &rs, result)
 		if !cfg.DryRun {
-			if err := mergeRoleState(ctx, cfg.Client, cfg.Owner, cfg.Repo, rec.Name, rs, &state); err != nil {
+			if err := mergeRoleState(ctx, cfg.Client, cfg.Owner, cfg.Repo, rec.Name, holder, now, rs, &state); err != nil {
 				result.Failed = append(result.Failed, RoleProvisionFailure{
 					Role: rec.Name, Secret: secret,
 					Reason: "recording administrator-provided distribution state failed",
@@ -379,7 +390,7 @@ func rotateOneRole(ctx context.Context, cfg RoleRotateConfig, rec gitlabroles.Re
 	if err != nil {
 		rs.Phase = rotationPhaseFailed
 		rs.Error = "project access token creation failed"
-		_ = mergeRoleState(ctx, cfg.Client, cfg.Owner, cfg.Repo, rec.Name, rs, &state)
+		_ = mergeRoleState(ctx, cfg.Client, cfg.Owner, cfg.Repo, rec.Name, holder, now, rs, &state)
 		result.Failed = append(result.Failed, RoleProvisionFailure{
 			Role: rec.Name, Secret: secret, Reason: rs.Error,
 		})
@@ -391,7 +402,7 @@ func rotateOneRole(ctx context.Context, cfg RoleRotateConfig, rec gitlabroles.Re
 		}
 		rs.Phase = rotationPhaseFailed
 		rs.Error = "project access token creation returned no value"
-		_ = mergeRoleState(ctx, cfg.Client, cfg.Owner, cfg.Repo, rec.Name, rs, &state)
+		_ = mergeRoleState(ctx, cfg.Client, cfg.Owner, cfg.Repo, rec.Name, holder, now, rs, &state)
 		result.Failed = append(result.Failed, RoleProvisionFailure{
 			Role: rec.Name, Secret: secret, Reason: rs.Error,
 		})
@@ -401,7 +412,7 @@ func rotateOneRole(ctx context.Context, cfg RoleRotateConfig, rec gitlabroles.Re
 		_ = cfg.Tokens.RevokeProjectAccessToken(ctx, cfg.Owner, cfg.Repo, tok.ID)
 		rs.Phase = rotationPhaseFailed
 		rs.Error = "replacement credential cannot be masked"
-		_ = mergeRoleState(ctx, cfg.Client, cfg.Owner, cfg.Repo, rec.Name, rs, &state)
+		_ = mergeRoleState(ctx, cfg.Client, cfg.Owner, cfg.Repo, rec.Name, holder, now, rs, &state)
 		result.Failed = append(result.Failed, RoleProvisionFailure{
 			Role: rec.Name, Secret: secret, Reason: rs.Error,
 		})
@@ -417,7 +428,7 @@ func rotateOneRole(ctx context.Context, cfg RoleRotateConfig, rec gitlabroles.Re
 	rs.OutgoingIDs = outgoing
 	rs.ExpiresAt = expiresAt
 	rs.Error = ""
-	if err := mergeRoleState(ctx, cfg.Client, cfg.Owner, cfg.Repo, rec.Name, rs, &state); err != nil {
+	if err := mergeRoleState(ctx, cfg.Client, cfg.Owner, cfg.Repo, rec.Name, holder, now, rs, &state); err != nil {
 		if revokeErr := cfg.Tokens.RevokeProjectAccessToken(ctx, cfg.Owner, cfg.Repo, tok.ID); revokeErr != nil {
 			result.Diagnostics = append(result.Diagnostics, fmt.Sprintf("%s: replacement PAT id %d left for cleanup after state failure", rec.Name, tok.ID))
 		}
@@ -439,7 +450,7 @@ func rotateOneRole(ctx context.Context, cfg RoleRotateConfig, rec gitlabroles.Re
 		rs.Phase = rotationPhaseFailed
 		rs.IncomingID = 0
 		rs.Error = "storing replacement credential failed"
-		_ = mergeRoleState(ctx, cfg.Client, cfg.Owner, cfg.Repo, rec.Name, rs, &state)
+		_ = mergeRoleState(ctx, cfg.Client, cfg.Owner, cfg.Repo, rec.Name, holder, now, rs, &state)
 		result.RolledBack = append(result.RolledBack, rec.Name)
 		result.Failed = append(result.Failed, RoleProvisionFailure{
 			Role: rec.Name, Secret: secret,
@@ -460,7 +471,7 @@ func rotateOneRole(ctx context.Context, cfg RoleRotateConfig, rec gitlabroles.Re
 	rs.OutgoingIDs = outgoing
 	rs.ExpiresAt = expiresAt
 	rs.Error = ""
-	if err := mergeRoleState(ctx, cfg.Client, cfg.Owner, cfg.Repo, rec.Name, rs, &state); err != nil {
+	if err := mergeRoleState(ctx, cfg.Client, cfg.Owner, cfg.Repo, rec.Name, holder, now, rs, &state); err != nil {
 		result.Failed = append(result.Failed, RoleProvisionFailure{
 			Role: rec.Name, Secret: secret,
 			Reason: "recording completed distribution state failed; replacement remains active",
@@ -641,15 +652,44 @@ func writeRotationState(ctx context.Context, client forge.Client, owner, repo st
 // with role's entry set to rs) so later reads in the same call see the
 // merged result. A read failure falls back to *state as-is rather than
 // blocking this role's own outcome from being recorded.
-func mergeRoleState(ctx context.Context, client forge.Client, owner, repo string, role gitlabroles.Role, rs rotationRoleState, state *rotationStateFile) error {
+//
+// When holder is non-empty, the write aborts with errRotationLockLost if
+// the freshly read document shows role's lock now held by a different,
+// still-valid holder: a concurrent process has since reclaimed the lock
+// (for example, this holder's lockTTL lapsed mid-rotation), and this
+// write must not clobber that process's state. Pass an empty holder to
+// skip this check, which is only correct for the initial lock claim,
+// before this holder owns the lock at all.
+func mergeRoleState(ctx context.Context, client forge.Client, owner, repo string, role gitlabroles.Role, holder string, now time.Time, rs rotationRoleState, state *rotationStateFile) error {
 	if fresh, _, err := loadRotationState(ctx, client, owner, repo); err == nil {
 		*state = fresh
 	}
 	if state.Roles == nil {
 		state.Roles = map[string]rotationRoleState{}
 	}
+	if holder != "" && otherHoldsRotationLock(state.Roles[string(role)], holder, now) {
+		return errRotationLockLost
+	}
 	state.Roles[string(role)] = rs
 	return writeRotationState(ctx, client, owner, repo, *state)
+}
+
+// recordInitialDistribution writes rotation-state proof for a role's PAT
+// created by initial provisioning (provisionOwnRoles), outside of
+// RotateGitLabRoleCredentials. Without this, a later rotation run cannot
+// tell a healthy just-provisioned credential apart from an unrecorded
+// orphan token and would immediately treat it as due for replacement.
+// The failure is non-fatal to provisioning; the caller only logs a
+// diagnostic, since the secret itself was already stored successfully.
+func recordInitialDistribution(ctx context.Context, client forge.Client, owner, repo string, role gitlabroles.Role, tokenID int, expiresAt string, now time.Time) error {
+	var state rotationStateFile
+	rs := rotationRoleState{
+		Phase:         rotationPhaseIdle,
+		IncomingID:    tokenID,
+		DistributedAt: now.UTC().Format(time.RFC3339),
+		ExpiresAt:     expiresAt,
+	}
+	return mergeRoleState(ctx, client, owner, repo, role, "", now, rs, &state)
 }
 
 func snapshotsFrom(toks []ProjectAccessToken) []gitlabroles.TokenSnapshot {

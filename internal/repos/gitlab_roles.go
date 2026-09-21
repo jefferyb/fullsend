@@ -308,6 +308,14 @@ func provisionOwnRoles(ctx context.Context, cfg RoleProvisionConfig, reg gitlabr
 		}
 		present[secret] = true
 		result.Created = append(result.Created, rec.Name)
+		// Record rotation-state proof of this initial distribution so a
+		// later RotateGitLabRoleCredentials run does not treat this
+		// healthy, just-provisioned PAT as an unproven orphan and
+		// immediately mint a replacement for it.
+		if err := recordInitialDistribution(ctx, cfg.Client, cfg.Owner, cfg.Repo, rec.Name, tok.ID, expiresAt, now); err != nil {
+			result.Diagnostics = append(result.Diagnostics, fmt.Sprintf(
+				"%s: recording rotation-state distribution proof failed; a future rotation run will treat this credential as unproven and replace it", rec.Name))
+		}
 	}
 }
 
