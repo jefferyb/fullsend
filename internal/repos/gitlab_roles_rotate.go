@@ -263,6 +263,12 @@ func rotateOneRole(ctx context.Context, cfg RoleRotateConfig, rec gitlabroles.Re
 			result.Diagnostics = append(result.Diagnostics, fmt.Sprintf("%s: concurrent rotation won the lock; skipping", rec.Name))
 			return
 		}
+		// Build every subsequent write on this freshly re-read document,
+		// not the snapshot loaded before the lock claim, so a sibling
+		// role's concurrent update landing in between is not silently
+		// reverted the next time this role's state is persisted.
+		state = claimed
+		rs = state.Roles[string(rec.Name)]
 	}
 	defer func() {
 		if cfg.DryRun {
@@ -287,8 +293,7 @@ func rotateOneRole(ctx context.Context, cfg RoleRotateConfig, rec gitlabroles.Re
 		cleaned := cleanupOutgoing(ctx, cfg, &rs, now, grace, listed)
 		if cleaned {
 			result.Cleaned = append(result.Cleaned, rec.Name)
-			state.Roles[string(rec.Name)] = rs
-			_ = writeRotationState(ctx, cfg.Client, cfg.Owner, cfg.Repo, state)
+			_ = mergeRoleState(ctx, cfg.Client, cfg.Owner, cfg.Repo, rec.Name, rs, &state)
 			matches = tokensNamed(*listed, tokenName)
 			current = currentListed(matches)
 		}
@@ -296,8 +301,23 @@ func rotateOneRole(ctx context.Context, cfg RoleRotateConfig, rec gitlabroles.Re
 
 	rr := roleReportFrom(ctx, cfg, rec, matches, now, lead)
 	freshExpiry := GitLabPATExpiresAt(now)
+	// A single active same-named PAT is unambiguous: its own expiry
+	// tells us whether it is due. But once more than one active
+	// same-named PAT exists (rr.Overlapping) or the state says a
+	// distribution was left incomplete, the live inventory alone cannot
+	// tell a legitimate post-rotation overlap apart from an unrecorded
+	// orphan token — one left behind by a crash before the distributing
+	// phase was even written, or one still mid-distribution. In that
+	// ambiguous case, only trust "not due" when the rotation state
+	// itself proves this process is the one that distributed the
+	// current live token (IncomingID matches it and DistributedAt is
+	// set); otherwise proceed so the recovery path below can run.
+	needsProof := rr.Overlapping || rs.Phase == rotationPhaseOverlapping ||
+		(rs.IncomingID != 0 && (rs.Phase == rotationPhaseDistributing || rs.Phase == rotationPhaseFailed))
+	distributionProven := rs.IncomingID != 0 && rs.IncomingID == current.ID && rs.DistributedAt != ""
+	needsRecovery := rs.IncomingID != 0 && (rs.Phase == rotationPhaseDistributing || rs.Phase == rotationPhaseFailed)
 	alreadyFresh := !cfg.Force && current.ID != 0 && current.Active && current.ExpiresAt == freshExpiry &&
-		rs.Phase != rotationPhaseDistributing && rs.Phase != rotationPhaseFailed
+		(!needsProof || distributionProven) && !needsRecovery
 	if alreadyFresh || (recentlyDistributed(rs, now) && !gitlabroles.RoleDueForRotation(rr)) {
 		result.Skipped = append(result.Skipped, rec.Name)
 		result.Diagnostics = append(result.Diagnostics, fmt.Sprintf("%s: already rotated (idempotent)", rec.Name))
@@ -306,7 +326,7 @@ func rotateOneRole(ctx context.Context, cfg RoleRotateConfig, rec gitlabroles.Re
 		}
 		return
 	}
-	if !cfg.Force && !gitlabroles.RoleDueForRotation(rr) {
+	if !cfg.Force && !gitlabroles.RoleDueForRotation(rr) && (!needsProof || distributionProven) && !needsRecovery {
 		result.Skipped = append(result.Skipped, rec.Name)
 		if rr.Overlapping || rs.Phase == rotationPhaseOverlapping {
 			result.Overlapping = append(result.Overlapping, rec.Name)
@@ -316,9 +336,8 @@ func rotateOneRole(ctx context.Context, cfg RoleRotateConfig, rec gitlabroles.Re
 
 	if provided := strings.TrimSpace(cfg.ProvidedTokens[rec.Name]); provided != "" {
 		rotateProvided(ctx, cfg, rec, secret, provided, now, matches, &rs, result)
-		state.Roles[string(rec.Name)] = rs
 		if !cfg.DryRun {
-			if err := writeRotationState(ctx, cfg.Client, cfg.Owner, cfg.Repo, state); err != nil {
+			if err := mergeRoleState(ctx, cfg.Client, cfg.Owner, cfg.Repo, rec.Name, rs, &state); err != nil {
 				result.Failed = append(result.Failed, RoleProvisionFailure{
 					Role: rec.Name, Secret: secret,
 					Reason: "recording administrator-provided distribution state failed",
@@ -360,8 +379,7 @@ func rotateOneRole(ctx context.Context, cfg RoleRotateConfig, rec gitlabroles.Re
 	if err != nil {
 		rs.Phase = rotationPhaseFailed
 		rs.Error = "project access token creation failed"
-		state.Roles[string(rec.Name)] = rs
-		_ = writeRotationState(ctx, cfg.Client, cfg.Owner, cfg.Repo, state)
+		_ = mergeRoleState(ctx, cfg.Client, cfg.Owner, cfg.Repo, rec.Name, rs, &state)
 		result.Failed = append(result.Failed, RoleProvisionFailure{
 			Role: rec.Name, Secret: secret, Reason: rs.Error,
 		})
@@ -373,8 +391,7 @@ func rotateOneRole(ctx context.Context, cfg RoleRotateConfig, rec gitlabroles.Re
 		}
 		rs.Phase = rotationPhaseFailed
 		rs.Error = "project access token creation returned no value"
-		state.Roles[string(rec.Name)] = rs
-		_ = writeRotationState(ctx, cfg.Client, cfg.Owner, cfg.Repo, state)
+		_ = mergeRoleState(ctx, cfg.Client, cfg.Owner, cfg.Repo, rec.Name, rs, &state)
 		result.Failed = append(result.Failed, RoleProvisionFailure{
 			Role: rec.Name, Secret: secret, Reason: rs.Error,
 		})
@@ -384,8 +401,7 @@ func rotateOneRole(ctx context.Context, cfg RoleRotateConfig, rec gitlabroles.Re
 		_ = cfg.Tokens.RevokeProjectAccessToken(ctx, cfg.Owner, cfg.Repo, tok.ID)
 		rs.Phase = rotationPhaseFailed
 		rs.Error = "replacement credential cannot be masked"
-		state.Roles[string(rec.Name)] = rs
-		_ = writeRotationState(ctx, cfg.Client, cfg.Owner, cfg.Repo, state)
+		_ = mergeRoleState(ctx, cfg.Client, cfg.Owner, cfg.Repo, rec.Name, rs, &state)
 		result.Failed = append(result.Failed, RoleProvisionFailure{
 			Role: rec.Name, Secret: secret, Reason: rs.Error,
 		})
@@ -401,8 +417,7 @@ func rotateOneRole(ctx context.Context, cfg RoleRotateConfig, rec gitlabroles.Re
 	rs.OutgoingIDs = outgoing
 	rs.ExpiresAt = expiresAt
 	rs.Error = ""
-	state.Roles[string(rec.Name)] = rs
-	if err := writeRotationState(ctx, cfg.Client, cfg.Owner, cfg.Repo, state); err != nil {
+	if err := mergeRoleState(ctx, cfg.Client, cfg.Owner, cfg.Repo, rec.Name, rs, &state); err != nil {
 		if revokeErr := cfg.Tokens.RevokeProjectAccessToken(ctx, cfg.Owner, cfg.Repo, tok.ID); revokeErr != nil {
 			result.Diagnostics = append(result.Diagnostics, fmt.Sprintf("%s: replacement PAT id %d left for cleanup after state failure", rec.Name, tok.ID))
 		}
@@ -424,8 +439,7 @@ func rotateOneRole(ctx context.Context, cfg RoleRotateConfig, rec gitlabroles.Re
 		rs.Phase = rotationPhaseFailed
 		rs.IncomingID = 0
 		rs.Error = "storing replacement credential failed"
-		state.Roles[string(rec.Name)] = rs
-		_ = writeRotationState(ctx, cfg.Client, cfg.Owner, cfg.Repo, state)
+		_ = mergeRoleState(ctx, cfg.Client, cfg.Owner, cfg.Repo, rec.Name, rs, &state)
 		result.RolledBack = append(result.RolledBack, rec.Name)
 		result.Failed = append(result.Failed, RoleProvisionFailure{
 			Role: rec.Name, Secret: secret,
@@ -446,8 +460,7 @@ func rotateOneRole(ctx context.Context, cfg RoleRotateConfig, rec gitlabroles.Re
 	rs.OutgoingIDs = outgoing
 	rs.ExpiresAt = expiresAt
 	rs.Error = ""
-	state.Roles[string(rec.Name)] = rs
-	if err := writeRotationState(ctx, cfg.Client, cfg.Owner, cfg.Repo, state); err != nil {
+	if err := mergeRoleState(ctx, cfg.Client, cfg.Owner, cfg.Repo, rec.Name, rs, &state); err != nil {
 		result.Failed = append(result.Failed, RoleProvisionFailure{
 			Role: rec.Name, Secret: secret,
 			Reason: "recording completed distribution state failed; replacement remains active",
@@ -488,13 +501,20 @@ func rotateProvided(ctx context.Context, cfg RoleRotateConfig, rec gitlabroles.R
 		})
 		return
 	}
-	outgoing := activeIDsExcept(matches, 0)
+	// The administrator-provided replacement's own GitLab token ID is
+	// not known here (only its secret value was supplied). If that
+	// replacement is itself a project access token GitLab already lists
+	// under this role's token name (the documented free-tier workflow,
+	// since creating project access tokens via the API requires GitLab
+	// Premium/Ultimate), it cannot be distinguished from a genuinely
+	// leftover same-named PAT among matches. Recording every active
+	// same-named token in outgoing_ids would let grace cleanup revoke
+	// the just-enrolled replacement itself. Until the replacement's own
+	// ID can be resolved, do not schedule any same-named active PAT for
+	// grace revocation.
 	rs.Phase = rotationPhaseIdle
-	if len(outgoing) > 0 {
-		rs.Phase = rotationPhaseOverlapping
-	}
 	rs.IncomingID = 0
-	rs.OutgoingIDs = outgoing
+	rs.OutgoingIDs = nil
 	rs.DistributedAt = now.Format(time.RFC3339)
 	rs.ExpiresAt = ""
 	rs.Error = ""
@@ -527,7 +547,7 @@ func cleanupOutgoing(ctx context.Context, cfg RoleRotateConfig, rs *rotationRole
 			remaining = append(remaining, id)
 			continue
 		}
-		removeListedID(listed, id)
+		deactivateListedToken(listed, id)
 		cleaned = true
 	}
 	rs.OutgoingIDs = remaining
@@ -614,6 +634,24 @@ func writeRotationState(ctx context.Context, client forge.Client, owner, repo st
 	return client.UpdateCIVariable(ctx, owner, repo, forge.VarGitLabRoleRotation, string(raw), true)
 }
 
+// mergeRoleState re-reads the rotation-state document immediately before
+// writing rs for role, so this write does not silently discard a sibling
+// role's concurrent update that landed after *state was last loaded in
+// this call. *state is updated in place (to the freshly read document,
+// with role's entry set to rs) so later reads in the same call see the
+// merged result. A read failure falls back to *state as-is rather than
+// blocking this role's own outcome from being recorded.
+func mergeRoleState(ctx context.Context, client forge.Client, owner, repo string, role gitlabroles.Role, rs rotationRoleState, state *rotationStateFile) error {
+	if fresh, _, err := loadRotationState(ctx, client, owner, repo); err == nil {
+		*state = fresh
+	}
+	if state.Roles == nil {
+		state.Roles = map[string]rotationRoleState{}
+	}
+	state.Roles[string(role)] = rs
+	return writeRotationState(ctx, client, owner, repo, *state)
+}
+
 func snapshotsFrom(toks []ProjectAccessToken) []gitlabroles.TokenSnapshot {
 	out := make([]gitlabroles.TokenSnapshot, 0, len(toks))
 	for _, tok := range toks {
@@ -683,7 +721,10 @@ func uniqueInts(ids []int) []int {
 	return out
 }
 
-func removeListedID(listed *[]ProjectAccessToken, id int) {
+// deactivateListedToken marks the token with the given ID inactive in
+// listed (in place) so later lifecycle analysis in this call treats it
+// as revoked. It does not remove the entry from the slice.
+func deactivateListedToken(listed *[]ProjectAccessToken, id int) {
 	if listed == nil {
 		return
 	}
@@ -816,7 +857,10 @@ func secretLeakRotate(result RoleRotateResult) string {
 
 // EnrichGitLabRoleStatus re-runs DiagnoseLifecycle with a token
 // inventory so repos status can report expiry, revocation, and
-// overlapping replacements. tokens may be nil.
+// overlapping replacements. tokens may be nil. It reports whether any
+// lifecycle drift entries were newly added to status.Drifts; callers
+// must not assume a false return means the repo is otherwise free of
+// drift, only that this call did not add to it.
 func EnrichGitLabRoleStatus(ctx context.Context, client forge.Client, owner, repo string, tokens []ProjectAccessToken, now time.Time, status *RepoStatus) bool {
 	if status == nil || client == nil {
 		return false

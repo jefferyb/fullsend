@@ -999,3 +999,61 @@ func TestAnnotateGitLabRoleLifecycleSkipsNonLiveClient(t *testing.T) {
 	annotateGitLabRoleLifecycle(context.Background(), nil, result)
 	assert.Equal(t, "migrating", result.Repos[0].GitLabRoleMode)
 }
+
+func TestAnnotateGitLabRoleLifecycleDoesNotDoubleCountDrifted(t *testing.T) {
+	ctx := context.Background()
+	registryJSON := `{"roles":[{"name":"scanner","credential":"own","capabilities":["read_issues"],"agents":["scanner"]}]}`
+	scannerSecret := gitlabroles.CustomSecretName(gitlabroles.Role("scanner"))
+	scannerToken := gitlabroles.CustomTokenName(gitlabroles.Role("scanner"))
+
+	mux := http.NewServeMux()
+	serveVariable := func(project, name, value string) {
+		mux.HandleFunc(fmt.Sprintf("/api/v4/projects/%s/variables/%s", project, name), func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{"value": value})
+		})
+	}
+	for _, project := range []string{"group%2Fproject-a", "group%2Fproject-b"} {
+		serveVariable(project, forge.VarGitLabRoleMigration, "enforced")
+		serveVariable(project, forge.VarGitLabRoleRegistry, registryJSON)
+		serveVariable(project, forge.SecretForgeToken, "present")
+		serveVariable(project, scannerSecret, "present")
+		project := project
+		mux.HandleFunc(fmt.Sprintf("/api/v4/projects/%s/access_tokens", project), func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode([]map[string]any{
+				{"id": 1, "name": scannerToken, "active": false},
+			})
+		})
+	}
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	glClient, err := gitlab.New("test-token", gitlab.WithBaseURL(srv.URL))
+	require.NoError(t, err)
+	clients := newSingleClientFactory(glClient)
+
+	t.Run("repo already counted as drifted is not double-counted", func(t *testing.T) {
+		result := &repos.StatusResult{
+			Repos: []repos.RepoStatus{{
+				Owner: "group", Repo: "project-a", GitLabRoleMode: "enforced",
+				Drifts: []repos.Drift{{Field: "current_ref", Expected: "a", Actual: "b"}},
+			}},
+			Summary: repos.StatusSummary{Drifted: 1},
+		}
+		annotateGitLabRoleLifecycle(ctx, clients, result)
+		require.Len(t, result.Repos[0].Drifts, 2, "the lifecycle drift must still be recorded")
+		assert.Equal(t, 1, result.Summary.Drifted, "already-drifted repo must not be counted twice")
+	})
+
+	t.Run("repo with no prior drift is counted once on the new drift", func(t *testing.T) {
+		result := &repos.StatusResult{
+			Repos: []repos.RepoStatus{{
+				Owner: "group", Repo: "project-b", GitLabRoleMode: "enforced",
+			}},
+			Summary: repos.StatusSummary{Drifted: 0},
+		}
+		annotateGitLabRoleLifecycle(ctx, clients, result)
+		require.Len(t, result.Repos[0].Drifts, 1)
+		assert.Equal(t, 1, result.Summary.Drifted, "no-drift to drift transition must be counted exactly once")
+	})
+}

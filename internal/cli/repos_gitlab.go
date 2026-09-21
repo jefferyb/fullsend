@@ -265,7 +265,12 @@ func annotateGitLabRoleLifecycle(ctx context.Context, clients repos.ForgeClientF
 		if listErr != nil {
 			continue
 		}
-		if repos.EnrichGitLabRoleStatus(ctx, fc.Client, st.Owner, st.Repo, toks, now, st) {
+		// repos.Status already counted this repo once in Summary.Drifted
+		// if it had any drift. Only count the no-drift -> drift
+		// transition here, or a repo with pre-existing drift that also
+		// gains a GitLab-role lifecycle drift gets double-counted.
+		wasDrifted := len(st.Drifts) > 0
+		if repos.EnrichGitLabRoleStatus(ctx, fc.Client, st.Owner, st.Repo, toks, now, st) && !wasDrifted {
 			result.Summary.Drifted++
 		}
 	}
