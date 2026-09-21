@@ -384,8 +384,9 @@ Leave these to the follow-up issues.
 
 ## Credential-routing security checklist
 
-Hold these four invariants when changing `internal/gitlabroles`, GitLab
-credential handling in `internal/cli`, or the remaining rollout stages
+Hold these four code invariants and the documentation-terminology rule
+below when changing `internal/gitlabroles`, GitLab credential handling
+in `internal/cli`, or the remaining rollout stages
 ([#7500](https://github.com/fullsend-ai/fullsend/issues/7500),
 [#7501](https://github.com/fullsend-ai/fullsend/issues/7501)). They are
 the review findings from [PR #7510](https://github.com/fullsend-ai/fullsend/pull/7510)
@@ -466,6 +467,33 @@ fallback.
       marked breaking.
 - [ ] Shared-token fallback is removed only in the #7501 cutover, after
       role checks pass, and is marked `!`.
+
+### Keep fallback terminology consistent across docs
+
+Two distinct fallback mechanisms share similar wording and are easy to
+conflate. Use these terms, and do not mix them:
+
+- **shared-token fallback** — selecting `FULLSEND_FORGE_TOKEN` as the
+  credential. This is the always-on path in `disabled` / `rollback`,
+  and the explicit fallback in `migrating` when that role's secret is
+  unconfigured. It does not apply in `enforced`.
+- **local direct-GITLAB_TOKEN fallback** — the documented local-dev
+  workflow where `GITLAB_TOKEN` is set with no `FULLSEND_FORGE_TOKEN`.
+  `fullsend run --forge gitlab` treats
+  `gitlabroles.ErrSharedUnconfigured` as a no-op in `disabled` /
+  `rollback` so the pre-set token still works. This path does **not**
+  apply in `migrating` or `enforced`.
+
+These two are described independently in four documents:
+
+- this file (`docs/contributing/gitlab-role-credentials.md`)
+- [`docs/cli/run.md`](../cli/run.md)
+- [`docs/guides/user/running-agents-locally.md`](../guides/user/running-agents-locally.md)
+- [`docs/problems/security-threat-model.md`](../problems/security-threat-model.md)
+
+- [ ] Any change that touches fallback or migration-gate behavior
+      re-reads all four documents and updates them with the same
+      terms. Do not edit only the file under your cursor.
 
 ## Security notes
 
