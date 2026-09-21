@@ -112,6 +112,11 @@ const (
 	// be a protected CI/CD variable, not repository or merge-request
 	// content. See internal/gitlabroles.
 	VarGitLabRoleRegistry = "FULLSEND_GITLAB_ROLE_REGISTRY"
+
+	// VarGitLabRoleRotation is the protected, unmasked rotation-state
+	// document (per-role lock, token IDs, expiry dates, phase). It
+	// never stores token values. See internal/gitlabroles and #7500.
+	VarGitLabRoleRotation = "FULLSEND_GITLAB_ROLE_ROTATION"
 )
 
 // ErrNotFound indicates a requested resource was not found on the forge.

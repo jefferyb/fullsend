@@ -295,6 +295,7 @@ func runReposStatus(cmd *cobra.Command, manifestPath string, jsonOutput bool, re
 	if err != nil {
 		return err
 	}
+	annotateGitLabRoleLifecycle(ctx, clients, result)
 
 	return renderStatusResult(cmd, result, jsonOutput)
 }
@@ -466,6 +467,9 @@ type reposInstallConfig struct {
 	gitlabRoleRegistryJSON string
 	gitlabRoleProvided     map[gitlabroles.Role]string
 	gitlabRoleModeFlag     gitlabroles.Mode
+	rotateGitLabRoles      bool
+	rotateGitLabRoleNames  []string
+	rotateGitLabRoleFilter []gitlabroles.Role
 
 	// Per-repo overrides
 	fullsendRef            string
@@ -541,6 +545,8 @@ GCP infrastructure (WIF, mint) must be provisioned separately via
 	cmd.Flags().StringVar(&opts.gitlabRoleMigration, "gitlab-role-migration", "", "GitLab role-credential gate: migrating, rollback, or disabled (default: migrating on fresh install; unchanged on existing installs)")
 	cmd.Flags().StringVar(&opts.gitlabRoleRegistry, "gitlab-role-registry", "", "path to administrator GitLab role registry JSON (custom roles; never secret values)")
 	cmd.Flags().StringArrayVar(&opts.gitlabRoleTokens, "gitlab-role-token", nil, "administrator-provided GitLab role PAT (repeatable, role=token); values are never logged")
+	cmd.Flags().BoolVar(&opts.rotateGitLabRoles, "rotate-gitlab-roles", false, "force-rotate GitLab role credentials even if they are not near expiry")
+	cmd.Flags().StringArrayVar(&opts.rotateGitLabRoleNames, "rotate-gitlab-role", nil, "rotate a specific GitLab role (repeatable); default is all own-credential roles that are due")
 	addVendorFlags(cmd, &opts.vendor, &opts.fullsendBinary, &opts.fullsendSource)
 
 	return cmd
@@ -1108,6 +1114,16 @@ func runReposInstall(ctx context.Context, opts *reposInstallConfig) error {
 			}
 			if err := maybeProvisionGitLabRoles(ctx, opts, fc.Client, printer, item.r.Owner, item.r.Repo, item.fresh); err != nil {
 				printer.StepWarn(fmt.Sprintf("[%s/%s] GitLab role provisioning failed: %v", item.r.Owner, item.r.Repo, err))
+				roleFail++
+				item.r.Error = err
+				if item.fresh {
+					roleFailInstalledCount++
+				}
+				roleFailedRepos = append(roleFailedRepos, item.r)
+				continue
+			}
+			if err := maybeRotateGitLabRoles(ctx, opts, fc.Client, printer, item.r.Owner, item.r.Repo); err != nil {
+				printer.StepWarn(fmt.Sprintf("[%s/%s] GitLab role rotation failed: %v", item.r.Owner, item.r.Repo, err))
 				roleFail++
 				item.r.Error = err
 				if item.fresh {

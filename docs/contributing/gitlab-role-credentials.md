@@ -15,12 +15,11 @@ The Go package is [`internal/gitlabroles`](../../internal/gitlabroles/).
 Provisioning of built-in and custom role credentials is implemented by
 `repos install` (`internal/repos` / `internal/cli`). Routing of jobs and
 forge operations by registered role is implemented by `fullsend poll`,
-`fullsend run`, and `fullsend post-review`. Rotation
-([#7500](https://github.com/fullsend-ai/fullsend/issues/7500)) and
-shared-token retirement
-([#7501](https://github.com/fullsend-ai/fullsend/issues/7501)) remain
-follow-up issues; both must follow the
-[credential-routing security checklist](#credential-routing-security-checklist).
+`fullsend run`, and `fullsend post-review`. Rotation, recovery, and
+in-flight overlap are implemented by `RotateGitLabRoleCredentials`
+(`internal/repos`) and invoked from `repos install`. Shared-token
+retirement remains a follow-up issue. Both rotation and retirement must
+follow the [credential-routing security checklist](#credential-routing-security-checklist).
 
 Built-in and custom roles are the same kind of registry entry. Job
 credential selection walks that registry; it does not switch on a
@@ -158,11 +157,13 @@ mode and policy without exposing secrets.
 | `FULLSEND_GITLAB_ROLE_<NAME>_TOKEN` | masked secret | Custom role PAT when `credential` is `own`. Provisioned when the role is registered. |
 | `FULLSEND_GITLAB_ROLE_MIGRATION` | unmasked variable | Feature gate. Absent or empty = `disabled`. |
 | `FULLSEND_GITLAB_ROLE_REGISTRY` | unmasked variable | Administrator registry JSON. Absent or empty = built-ins only. |
+| `FULLSEND_GITLAB_ROLE_ROTATION` | unmasked variable | Per-role rotation state (lock, token IDs, expiry dates, phase). Never stores token values. |
 
 Canonical constants live in [`internal/forge/forge.go`](../../internal/forge/forge.go)
 (`SecretForgeToken`, `SecretGitLabPollerToken`,
 `SecretGitLabAnalystToken`, `SecretGitLabCoderToken`,
-`VarGitLabRoleMigration`, `VarGitLabRoleRegistry`). Custom secret names
+`VarGitLabRoleMigration`, `VarGitLabRoleRegistry`,
+`VarGitLabRoleRotation`). Custom secret names
 are derived by `gitlabroles.CustomSecretName`.
 
 Role secrets and the registry **must not** be added to
@@ -325,8 +326,9 @@ Classification of a missing role secret:
 
 A role secret that is present while the gate is `disabled` or
 `rollback` is reported as "configured but unused". That is not an
-error; leftover secrets after rollback are expected until uninstall or
-rotation (#7500) removes them.
+error; leftover secrets after rollback are expected until uninstall
+removes them. `repos install --rotate-gitlab-roles` refreshes those
+leftover secrets without changing the gate; it does not remove them.
 
 **Never** put token values in logs, status output, issue comments, or
 `Error` strings. Presence booleans and variable names are the only
@@ -370,6 +372,58 @@ equal the derived `FULLSEND_GITLAB_ROLE_<NAME>_TOKEN` when set.
 `repos install --gitlab-role-registry` writes this variable.
 Agents and repository files do not.
 
+## Rotation and recovery
+
+GitLab project access tokens expire in at most one year. Fullsend
+rotates each own-credential registered role independently — built-in
+Poller, Analyst, and Coder, and custom `own` roles. A `reuse` role
+follows its target; it is not minted a second time.
+
+`repos install` rotates a role when `DiagnoseLifecycle` reports it as
+expiring (within 30 days), expired, revoked, or unverified (secret
+present but no matching project access token), and the gate is
+`migrating` or `enforced`. `--rotate-gitlab-roles` force-rotates every
+own-credential role. `--rotate-gitlab-role=<name>` limits the run to
+that role (repeatable). `--rotate-gitlab-roles` on `disabled` or
+`rollback` refreshes leftover role secrets without changing the gate.
+
+**Create-then-distribute, not GitLab's rotate-in-place API.** GitLab's
+token-rotate endpoint invalidates the previous secret immediately.
+Fullsend creates a new PAT with the same token name, writes it to the
+existing masked CI variable, and leaves the previous PAT active for a
+24-hour grace so jobs that already hold the old value in their
+environment can finish. A later `repos install` after the grace period
+revokes the outgoing PAT. New jobs started after distribution read the
+replacement from CI.
+
+**Failed rotation does not strand a role.** If creation fails, nothing
+is written. If distribution fails, only the unused replacement PAT is
+revoked and the previous CI secret is left in place. Concurrent
+attempts for the same role are serialized (in-process lock plus a
+protected rotation-state document) and idempotent within a five-minute
+window: a retry adopts the already-distributed replacement rather than
+minting another. A crash after create but before store is recovered by
+revoking the orphan incoming PAT (its value is only returned at
+creation) and minting a fresh one.
+
+**No silent shared-token fallback.** Rotation never writes
+`FULLSEND_FORGE_TOKEN` and never selects the shared credential because
+a role rotation failed. The shared token remains available only through
+the explicit migration/rollback gate. Runtime 401/403 of a selected
+role credential is still `ErrAuthFailed`.
+
+**Identity continuity.** GitLab assigns a new bot user per PAT, so the
+GitLab user ID changes on replacement. Fullsend preserves the role
+name, token name (`fullsend-poller`, `fullsend-role-<name>`), CI
+variable, and capability set. Rotation state records the old and new
+token IDs (never secret values) so `repos status` can show the chain.
+
+**Diagnostics.** `DiagnoseLifecycle` classifies each role as `ok`,
+`expiring`, `expired`, `revoked`, `unverified`, `overlapping`, or
+`unconfigured`. `repos status` reports those names and, in `enforced`
+mode, treats expired and revoked credentials as drift. Lines carry
+secret *names*, dates, and token IDs only.
+
 ## What this contract does not do
 
 Leave these to the follow-up issues.
@@ -378,7 +432,7 @@ Leave these to the follow-up issues.
 | --- | --- |
 | [#7498](https://github.com/fullsend-ai/fullsend/issues/7498) | **Implemented.** `repos install` creates/enrolls built-in and custom PATs, stores them as protected masked CI variables, writes the registry, sets the gate, reports partial provisioning, preserves the shared token, and handles reinstall/drift/uninstall without deleting credentials still in use |
 | [#7499](https://github.com/fullsend-ai/fullsend/issues/7499) | **Implemented.** `fullsend poll`, `fullsend run`, and `fullsend post-review` select the registered role credential, enforce `ValidateAgent` / `Registration.Has` in role-aware modes, and fail closed on authentication failure without switching identities |
-| [#7500](https://github.com/fullsend-ai/fullsend/issues/7500) | Rotation, recovery, in-flight jobs, expiry/revocation diagnostics. Hold the [credential-routing security checklist](#credential-routing-security-checklist) |
+| [#7500](https://github.com/fullsend-ai/fullsend/issues/7500) | **Implemented.** Role-aware rotation, recovery, in-flight overlap, and expiry/revocation diagnostics. See [Rotation and recovery](#rotation-and-recovery) and follow the [credential-routing security checklist](#credential-routing-security-checklist) |
 | [#7501](https://github.com/fullsend-ai/fullsend/issues/7501) | Verification, enable `enforced`, retire the shared token. Hold the [credential-routing security checklist](#credential-routing-security-checklist) |
 | [#7502](https://github.com/fullsend-ai/fullsend/issues/7502) | ADR 0067 status annotation and operator-facing lifecycle docs |
 

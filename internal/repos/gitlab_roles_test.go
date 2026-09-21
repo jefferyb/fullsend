@@ -20,25 +20,54 @@ type fakeTokens struct {
 	mu         sync.Mutex
 	nextID     int
 	created    []ProjectAccessToken
+	listed     []ProjectAccessToken
 	revoked    []int
 	failCreate map[string]error
 	failRevoke error
+	failList   error
 	emptyValue map[string]bool
 }
 
-func (f *fakeTokens) CreateProjectAccessToken(_ context.Context, _, _, name string, _ []string, _ int, _ string) (*ProjectAccessToken, error) {
+func (f *fakeTokens) seed(tok ProjectAccessToken) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if tok.ID == 0 {
+		f.nextID++
+		tok.ID = f.nextID
+	} else if tok.ID > f.nextID {
+		f.nextID = tok.ID
+	}
+	tok.Token = ""
+	f.listed = append(f.listed, tok)
+}
+
+func (f *fakeTokens) CreateProjectAccessToken(_ context.Context, _, _, name string, _ []string, _ int, expiresAt string) (*ProjectAccessToken, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.failCreate[name]; err != nil {
 		return nil, err
 	}
 	f.nextID++
-	tok := ProjectAccessToken{ID: f.nextID, Name: name, Token: leakToken + "-" + name}
+	tok := ProjectAccessToken{ID: f.nextID, Name: name, Token: leakToken + "-" + name, Active: true, ExpiresAt: expiresAt}
 	if f.emptyValue[name] {
 		tok.Token = ""
 	}
 	f.created = append(f.created, tok)
+	listed := tok
+	listed.Token = ""
+	f.listed = append(f.listed, listed)
 	return &tok, nil
+}
+
+func (f *fakeTokens) ListProjectAccessTokens(_ context.Context, _, _ string) ([]ProjectAccessToken, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failList != nil {
+		return nil, f.failList
+	}
+	out := make([]ProjectAccessToken, len(f.listed))
+	copy(out, f.listed)
+	return out, nil
 }
 
 func (f *fakeTokens) RevokeProjectAccessToken(_ context.Context, _, _ string, tokenID int) error {
@@ -48,6 +77,11 @@ func (f *fakeTokens) RevokeProjectAccessToken(_ context.Context, _, _ string, to
 		return f.failRevoke
 	}
 	f.revoked = append(f.revoked, tokenID)
+	for i := range f.listed {
+		if f.listed[i].ID == tokenID {
+			f.listed[i].Active = false
+		}
+	}
 	return nil
 }
 
@@ -522,6 +556,7 @@ func TestIsGitLabRoleManagedVar(t *testing.T) {
 	t.Parallel()
 	assert.True(t, IsGitLabRoleManagedVar(forge.VarGitLabRoleMigration))
 	assert.True(t, IsGitLabRoleManagedVar(forge.VarGitLabRoleRegistry))
+	assert.True(t, IsGitLabRoleManagedVar(forge.VarGitLabRoleRotation))
 	assert.True(t, IsGitLabRoleManagedVar(forge.SecretGitLabPollerToken))
 	assert.True(t, IsGitLabRoleManagedVar(forge.SecretGitLabAnalystToken))
 	assert.True(t, IsGitLabRoleManagedVar(forge.SecretGitLabCoderToken))
@@ -538,6 +573,7 @@ func TestCheckOrphanVars_GitLabRoleArtifactsNotFlagged(t *testing.T) {
 	fc.VariableValues["owner/repo/"+forge.SecretDispatch] = "x"
 	fc.VariableValues["owner/repo/"+forge.VarGitLabRoleMigration] = "migrating"
 	fc.VariableValues["owner/repo/"+forge.VarGitLabRoleRegistry] = `{"roles":[]}`
+	fc.VariableValues["owner/repo/"+forge.VarGitLabRoleRotation] = `{"roles":{}}`
 	fc.VariableValues["owner/repo/"+forge.SecretGitLabPollerToken] = "x"
 	fc.VariableValues["owner/repo/"+forge.SecretGitLabAnalystToken] = "x"
 	fc.VariableValues["owner/repo/"+forge.SecretGitLabCoderToken] = "x"

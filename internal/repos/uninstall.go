@@ -39,6 +39,7 @@ var gitlabUninstallVars = []string{
 	forge.VarLegacyWIFProvider,
 	forge.VarGitLabRoleMigration,
 	forge.VarGitLabRoleRegistry,
+	forge.VarGitLabRoleRotation,
 	forge.SecretGitLabPollerToken,
 	forge.SecretGitLabAnalystToken,
 	forge.SecretGitLabCoderToken,

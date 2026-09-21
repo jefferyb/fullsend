@@ -80,7 +80,9 @@ fullsend
 │   │   ├── --gitlab-bot-token <token>       #   GitLab bot PAT for free-tier instances
 │   │   ├── --gitlab-role-migration <mode>   #   GitLab role-credential gate (migrating|rollback|disabled)
 │   │   ├── --gitlab-role-registry <path>    #   Administrator GitLab role registry JSON
-│   │   └── --gitlab-role-token role=token   #   Administrator-provided GitLab role PAT (repeatable)
+│   │   ├── --gitlab-role-token role=token   #   Administrator-provided GitLab role PAT (repeatable)
+│   │   ├── --rotate-gitlab-roles            #   Force-rotate GitLab role credentials
+│   │   └── --rotate-gitlab-role <name>      #   Rotate a specific GitLab role (repeatable)
 │   ├── uninstall    <repos...>              # Tear down fullsend from repos and remove from manifest
 │   │   ├── -f, --manifest <path>            #   Path to repos.yaml (default: repos.yaml)
 │   │   ├── --dry-run                        #   Preview without making changes

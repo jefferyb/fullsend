@@ -29,15 +29,20 @@ func canMaskGitLabValue(value string) bool {
 // present only at creation time; it must never appear in logs, status,
 // or Error strings.
 type ProjectAccessToken struct {
-	ID    int
-	Name  string
-	Token string
+	ID        int
+	Name      string
+	Token     string
+	Active    bool
+	ExpiresAt string
+	Revoked   bool
 }
 
-// ProjectAccessTokenClient creates and revokes GitLab project access
-// tokens. Implementations must not log token values.
+// ProjectAccessTokenClient creates, lists, and revokes GitLab project
+// access tokens. Implementations must not log token values. List results
+// typically omit Token (GitLab returns the secret only at creation).
 type ProjectAccessTokenClient interface {
 	CreateProjectAccessToken(ctx context.Context, owner, repo, name string, scopes []string, accessLevel int, expiresAt string) (*ProjectAccessToken, error)
+	ListProjectAccessTokens(ctx context.Context, owner, repo string) ([]ProjectAccessToken, error)
 	RevokeProjectAccessToken(ctx context.Context, owner, repo string, tokenID int) error
 }
 
@@ -104,6 +109,7 @@ func GitLabPATExpiresAt(now time.Time) string {
 func IsGitLabRoleManagedVar(name string) bool {
 	switch name {
 	case forge.VarGitLabRoleMigration, forge.VarGitLabRoleRegistry,
+		forge.VarGitLabRoleRotation,
 		forge.SecretGitLabPollerToken, forge.SecretGitLabAnalystToken,
 		forge.SecretGitLabCoderToken:
 		return true
@@ -117,6 +123,7 @@ func IsGitLabRoleManagedVar(name string) bool {
 var gitLabRoleUninstallVars = []string{
 	forge.VarGitLabRoleMigration,
 	forge.VarGitLabRoleRegistry,
+	forge.VarGitLabRoleRotation,
 	forge.SecretGitLabPollerToken,
 	forge.SecretGitLabAnalystToken,
 	forge.SecretGitLabCoderToken,

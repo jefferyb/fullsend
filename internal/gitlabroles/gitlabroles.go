@@ -6,11 +6,13 @@
 // selects a credential from that registry; it does not branch on a
 // three-role enum.
 //
-// This package is the internal contract for provisioning (#7498) and
-// routing (#7499). Select / SelectAgent / Require are the dispatch-time
-// entry points wired into fullsend poll, fullsend run, and post-review.
-// When migration mode is disabled (the default), Resolve selects the
-// shared FULLSEND_FORGE_TOKEN exactly as existing installations do.
+// This package is the internal contract for provisioning (#7498),
+// routing (#7499), and rotation/recovery (#7500). Select / SelectAgent
+// / Require are the dispatch-time entry points wired into fullsend
+// poll, fullsend run, and post-review. DiagnoseLifecycle reports
+// expiry, revocation, and overlapping tokens. When migration mode is
+// disabled (the default), Resolve selects the shared
+// FULLSEND_FORGE_TOKEN exactly as existing installations do.
 //
 // Canonical documentation: docs/contributing/gitlab-role-credentials.md.
 package gitlabroles
@@ -72,8 +74,8 @@ const (
 )
 
 // RoleState is the configured/unconfigured status of one role secret.
-// Presence is boolean; this contract does not inspect expiry or
-// authorization (those belong to #7500).
+// Presence is boolean. Expiry, revocation, and overlapping tokens are
+// reported by DiagnoseLifecycle as LifecycleState on RoleReport.
 type RoleState string
 
 const (
@@ -202,6 +204,12 @@ type RoleReport struct {
 	TokenName  string
 	ReuseOf    Role
 	State      RoleState
+	// Lifecycle is presence plus expiry/revocation. Empty when no
+	// token inventory was supplied to DiagnoseLifecycle.
+	Lifecycle   LifecycleState
+	ExpiresAt   string
+	TokenIDs    []int
+	Overlapping bool
 }
 
 // Report is the observable migration/role status. Diagnostics never

@@ -1,0 +1,856 @@
+package repos
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/fullsend-ai/fullsend/internal/forge"
+	"github.com/fullsend-ai/fullsend/internal/gitlabroles"
+)
+
+var roleRotateLocks sync.Map // owner/repo/role -> *sync.Mutex
+
+const (
+	rotationPhaseIdle         = "idle"
+	rotationPhaseDistributing = "distributing"
+	rotationPhaseOverlapping  = "overlapping"
+	rotationPhaseFailed       = "failed"
+
+	defaultRotateLockTTL = 10 * time.Minute
+)
+
+// RoleRotateConfig is the input to RotateGitLabRoleCredentials.
+type RoleRotateConfig struct {
+	Owner    string
+	Repo     string
+	Client   forge.Client
+	Tokens   ProjectAccessTokenClient
+	Registry gitlabroles.Registry
+	Mode     gitlabroles.Mode
+	// Roles limits rotation to these names. Empty means every
+	// own-credential registered role.
+	Roles []gitlabroles.Role
+	// Force rotates even when the current PAT is not yet due.
+	Force bool
+	// LeadTime is how far ahead of expiry a credential is due.
+	// Zero uses gitlabroles.DefaultRotationLead.
+	LeadTime time.Duration
+	// GracePeriod is how long the previous PAT stays active after a
+	// successful distribution so in-flight jobs can finish. Zero uses
+	// gitlabroles.DefaultRotationGrace.
+	GracePeriod time.Duration
+	Now         time.Time
+	DryRun      bool
+	Holder      string
+	LockTTL     time.Duration
+	// ProvidedTokens maps a role name to an administrator-supplied
+	// replacement PAT. Values must never be logged.
+	ProvidedTokens map[gitlabroles.Role]string
+}
+
+// RoleRotateResult is the observable outcome of a rotation run.
+// Token values are not included.
+type RoleRotateResult struct {
+	Mode            gitlabroles.Mode
+	Report          gitlabroles.Report
+	Rotated         []gitlabroles.Role
+	Skipped         []gitlabroles.Role
+	Reused          []gitlabroles.Role
+	Failed          []RoleProvisionFailure
+	Overlapping     []gitlabroles.Role
+	RolledBack      []gitlabroles.Role
+	Cleaned         []gitlabroles.Role
+	InProgress      []gitlabroles.Role
+	SharedPreserved bool
+	DryRun          bool
+	Diagnostics     []string
+}
+
+type rotationStateFile struct {
+	Roles map[string]rotationRoleState `json:"roles"`
+}
+
+type rotationRoleState struct {
+	Phase         string `json:"phase,omitempty"`
+	Holder        string `json:"holder,omitempty"`
+	LockUntil     string `json:"lock_until,omitempty"`
+	IncomingID    int    `json:"incoming_id,omitempty"`
+	OutgoingIDs   []int  `json:"outgoing_ids,omitempty"`
+	DistributedAt string `json:"distributed_at,omitempty"`
+	ExpiresAt     string `json:"expires_at,omitempty"`
+	Error         string `json:"error,omitempty"`
+}
+
+// RotateGitLabRoleCredentials replaces due (or Force) own-credential
+// GitLab role PATs without touching FULLSEND_FORGE_TOKEN.
+//
+// Create-then-distribute is used instead of GitLab's rotate-in-place
+// API so the previous credential stays valid until grace cleanup:
+// in-flight jobs that already hold the old token keep working. A
+// failed create or distribution rolls the attempt back (revokes only
+// the unused replacement) and leaves the last known-good secret in
+// place. Concurrent callers for the same role are serialized and
+// idempotent within gitlabroles.IdempotentRotationWindow.
+func RotateGitLabRoleCredentials(ctx context.Context, cfg RoleRotateConfig) (RoleRotateResult, error) {
+	result := RoleRotateResult{SharedPreserved: true, DryRun: cfg.DryRun}
+	if cfg.Client == nil {
+		return result, fmt.Errorf("GitLab role rotation requires a forge client")
+	}
+	mode := cfg.Mode
+	if mode == "" {
+		mode = gitlabroles.ModeDisabled
+	}
+	if !mode.Valid() {
+		return result, fmt.Errorf("%w: %q", gitlabroles.ErrInvalidMode, mode)
+	}
+	result.Mode = mode
+	reg := cfg.Registry
+	if len(reg.Registrations()) == 0 {
+		reg = gitlabroles.BuiltinRegistry()
+	}
+	cfg.Registry = reg
+	now := cfg.Now
+	if now.IsZero() {
+		now = time.Now()
+	}
+	now = now.UTC()
+	lead := cfg.LeadTime
+	if lead <= 0 {
+		lead = gitlabroles.DefaultRotationLead
+	}
+	grace := cfg.GracePeriod
+	switch {
+	case cfg.GracePeriod < 0:
+		grace = 0
+	case cfg.GracePeriod == 0:
+		grace = gitlabroles.DefaultRotationGrace
+	}
+	holder := strings.TrimSpace(cfg.Holder)
+	if holder == "" {
+		holder = fmt.Sprintf("rotate-%d", now.UnixNano())
+	}
+	lockTTL := cfg.LockTTL
+	if lockTTL <= 0 {
+		lockTTL = defaultRotateLockTTL
+	}
+
+	if mode.UsesSharedOnly() && !cfg.Force && len(cfg.Roles) == 0 {
+		result.Diagnostics = append(result.Diagnostics, fmt.Sprintf(
+			"mode=%s: role credentials unused; skip rotation (pass --rotate-gitlab-roles to refresh leftover secrets)", mode))
+		present, presErr := gitLabRolePresence(ctx, cfg.Client, cfg.Owner, cfg.Repo, reg)
+		if presErr != nil {
+			return result, fmt.Errorf("reading GitLab role credential presence: %w", presErr)
+		}
+		result.Report = gitlabroles.Diagnose(mode, present, reg)
+		result.Diagnostics = append(result.Diagnostics, result.Report.Diagnostics...)
+		return result, nil
+	}
+
+	if cfg.Tokens == nil && len(cfg.ProvidedTokens) == 0 {
+		if cfg.Force {
+			return result, fmt.Errorf("GitLab role rotation requires a token client or administrator-provided credentials")
+		}
+		result.Diagnostics = append(result.Diagnostics, "no GitLab token client; skip rotation")
+		return result, nil
+	}
+
+	var listed []ProjectAccessToken
+	if cfg.Tokens != nil {
+		toks, err := cfg.Tokens.ListProjectAccessTokens(ctx, cfg.Owner, cfg.Repo)
+		if err != nil {
+			return result, fmt.Errorf("listing GitLab project access tokens: %w", err)
+		}
+		listed = toks
+	}
+
+	if _, presErr := gitLabRolePresence(ctx, cfg.Client, cfg.Owner, cfg.Repo, reg); presErr != nil {
+		return result, fmt.Errorf("reading GitLab role credential presence: %w", presErr)
+	}
+	want := wantedRoles(cfg.Roles, reg)
+
+	for _, rec := range reg.Registrations() {
+		if rec.Credential.Kind == gitlabroles.CredentialReuse {
+			if roleWanted(want, rec.Name) {
+				result.Reused = append(result.Reused, rec.Name)
+			}
+			continue
+		}
+		if !roleWanted(want, rec.Name) {
+			continue
+		}
+		rotateOneRole(ctx, cfg, rec, holder, lockTTL, now, lead, grace, &listed, &result)
+	}
+
+	if cfg.Tokens != nil && !cfg.DryRun {
+		if toks, err := cfg.Tokens.ListProjectAccessTokens(ctx, cfg.Owner, cfg.Repo); err == nil {
+			listed = toks
+		}
+	}
+	present, presErr := gitLabRolePresence(ctx, cfg.Client, cfg.Owner, cfg.Repo, reg)
+	if presErr != nil {
+		return result, fmt.Errorf("reading GitLab role credential presence: %w", presErr)
+	}
+	result.Report = gitlabroles.DiagnoseLifecycle(mode, present, reg, snapshotsFrom(listed), now, lead)
+	result.Diagnostics = append(result.Diagnostics, result.Report.Diagnostics...)
+	sortRoleLists(&result)
+	if secretLeakRotate(result) != "" {
+		return RoleRotateResult{SharedPreserved: true}, fmt.Errorf("internal error: rotation result leaked a secret value")
+	}
+	return result, nil
+}
+
+func rotateOneRole(ctx context.Context, cfg RoleRotateConfig, rec gitlabroles.Registration, holder string, lockTTL time.Duration, now time.Time, lead, grace time.Duration, listed *[]ProjectAccessToken, result *RoleRotateResult) {
+	unlock := lockGitLabRoleRotation(cfg.Owner, cfg.Repo, rec.Name)
+	defer unlock()
+
+	if cfg.Tokens != nil {
+		if toks, err := cfg.Tokens.ListProjectAccessTokens(ctx, cfg.Owner, cfg.Repo); err == nil {
+			*listed = toks
+		}
+	}
+
+	secret := rec.Credential.SecretName
+	tokenName := rec.Credential.TokenName
+	if tokenName == "" {
+		tokenName = gitlabroles.CustomTokenName(rec.Name)
+	}
+
+	state, stateDiags, stateErr := loadRotationState(ctx, cfg.Client, cfg.Owner, cfg.Repo)
+	result.Diagnostics = append(result.Diagnostics, stateDiags...)
+	if stateErr != nil {
+		result.Failed = append(result.Failed, RoleProvisionFailure{
+			Role: rec.Name, Secret: secret, Reason: "reading rotation state failed",
+		})
+		result.Diagnostics = append(result.Diagnostics, fmt.Sprintf("%s: rotation state is invalid or unavailable; refusing to rotate", rec.Name))
+		return
+	}
+	rs := state.Roles[string(rec.Name)]
+	if otherHoldsRotationLock(rs, holder, now) {
+		result.InProgress = append(result.InProgress, rec.Name)
+		result.Diagnostics = append(result.Diagnostics, fmt.Sprintf("%s: rotation in progress; skipping", rec.Name))
+		return
+	}
+
+	if !cfg.DryRun {
+		rs.Holder = holder
+		rs.LockUntil = now.Add(lockTTL).Format(time.RFC3339)
+		state.Roles[string(rec.Name)] = rs
+		if err := writeRotationState(ctx, cfg.Client, cfg.Owner, cfg.Repo, state); err != nil {
+			result.Failed = append(result.Failed, RoleProvisionFailure{
+				Role: rec.Name, Secret: secret, Reason: "writing rotation lock failed",
+			})
+			return
+		}
+		// The forge variable API has no compare-and-swap operation. Re-read
+		// immediately after claiming so a concurrent process that overwrote
+		// this claim is detected before minting a token. The in-process lock
+		// remains a fast path, but cannot provide cross-process exclusion.
+		claimed, _, err := loadRotationState(ctx, cfg.Client, cfg.Owner, cfg.Repo)
+		if err != nil {
+			result.Failed = append(result.Failed, RoleProvisionFailure{
+				Role: rec.Name, Secret: secret, Reason: "verifying rotation lock failed",
+			})
+			return
+		}
+		if claimed.Roles[string(rec.Name)].Holder != holder {
+			result.InProgress = append(result.InProgress, rec.Name)
+			result.Diagnostics = append(result.Diagnostics, fmt.Sprintf("%s: concurrent rotation won the lock; skipping", rec.Name))
+			return
+		}
+	}
+	defer func() {
+		if cfg.DryRun {
+			return
+		}
+		st, _, err := loadRotationState(ctx, cfg.Client, cfg.Owner, cfg.Repo)
+		if err != nil {
+			return
+		}
+		cur := st.Roles[string(rec.Name)]
+		if cur.Holder == holder {
+			cur.Holder = ""
+			cur.LockUntil = ""
+			st.Roles[string(rec.Name)] = cur
+			_ = writeRotationState(ctx, cfg.Client, cfg.Owner, cfg.Repo, st)
+		}
+	}()
+
+	matches := tokensNamed(*listed, tokenName)
+	current := currentListed(matches)
+	if !cfg.DryRun {
+		cleaned := cleanupOutgoing(ctx, cfg, &rs, now, grace, listed)
+		if cleaned {
+			result.Cleaned = append(result.Cleaned, rec.Name)
+			state.Roles[string(rec.Name)] = rs
+			_ = writeRotationState(ctx, cfg.Client, cfg.Owner, cfg.Repo, state)
+			matches = tokensNamed(*listed, tokenName)
+			current = currentListed(matches)
+		}
+	}
+
+	rr := roleReportFrom(ctx, cfg, rec, matches, now, lead)
+	freshExpiry := GitLabPATExpiresAt(now)
+	alreadyFresh := !cfg.Force && current.ID != 0 && current.Active && current.ExpiresAt == freshExpiry &&
+		rs.Phase != rotationPhaseDistributing && rs.Phase != rotationPhaseFailed
+	if alreadyFresh || (recentlyDistributed(rs, now) && !gitlabroles.RoleDueForRotation(rr)) {
+		result.Skipped = append(result.Skipped, rec.Name)
+		result.Diagnostics = append(result.Diagnostics, fmt.Sprintf("%s: already rotated (idempotent)", rec.Name))
+		if rs.Phase == rotationPhaseOverlapping || rr.Overlapping {
+			result.Overlapping = append(result.Overlapping, rec.Name)
+		}
+		return
+	}
+	if !cfg.Force && !gitlabroles.RoleDueForRotation(rr) {
+		result.Skipped = append(result.Skipped, rec.Name)
+		if rr.Overlapping || rs.Phase == rotationPhaseOverlapping {
+			result.Overlapping = append(result.Overlapping, rec.Name)
+		}
+		return
+	}
+
+	if provided := strings.TrimSpace(cfg.ProvidedTokens[rec.Name]); provided != "" {
+		rotateProvided(ctx, cfg, rec, secret, provided, now, matches, &rs, result)
+		state.Roles[string(rec.Name)] = rs
+		if !cfg.DryRun {
+			if err := writeRotationState(ctx, cfg.Client, cfg.Owner, cfg.Repo, state); err != nil {
+				result.Failed = append(result.Failed, RoleProvisionFailure{
+					Role: rec.Name, Secret: secret,
+					Reason: "recording administrator-provided distribution state failed",
+				})
+			}
+		}
+		return
+	}
+	if cfg.Tokens == nil {
+		result.Failed = append(result.Failed, RoleProvisionFailure{
+			Role: rec.Name, Secret: secret,
+			Reason: "no GitLab token client and no administrator-provided credential",
+		})
+		return
+	}
+
+	if cfg.DryRun {
+		result.Rotated = append(result.Rotated, rec.Name)
+		result.Diagnostics = append(result.Diagnostics, fmt.Sprintf("%s: would rotate (%s)", rec.Name, secret))
+		return
+	}
+
+	if rs.Phase == rotationPhaseDistributing && rs.IncomingID != 0 {
+		// The state may be stale after a crash immediately after the CI
+		// variable was updated. The incoming token may therefore be the
+		// live credential; never revoke it without proof that distribution
+		// did not complete. Keep it in the outgoing set and let the normal
+		// grace cleanup retire it after a replacement is distributed.
+		if !containsInt(rs.OutgoingIDs, rs.IncomingID) {
+			rs.OutgoingIDs = append(rs.OutgoingIDs, rs.IncomingID)
+		}
+		rs.Phase = rotationPhaseFailed
+		rs.Error = "previous distribution state was incomplete; preserving incoming token for safe recovery"
+	}
+
+	expiresAt := GitLabPATExpiresAt(now)
+	tok, err := cfg.Tokens.CreateProjectAccessToken(ctx, cfg.Owner, cfg.Repo, tokenName,
+		gitlabroles.TokenScopes(), gitlabroles.DeveloperAccessLevel, expiresAt)
+	if err != nil {
+		rs.Phase = rotationPhaseFailed
+		rs.Error = "project access token creation failed"
+		state.Roles[string(rec.Name)] = rs
+		_ = writeRotationState(ctx, cfg.Client, cfg.Owner, cfg.Repo, state)
+		result.Failed = append(result.Failed, RoleProvisionFailure{
+			Role: rec.Name, Secret: secret, Reason: rs.Error,
+		})
+		return
+	}
+	if tok == nil || strings.TrimSpace(tok.Token) == "" {
+		if tok != nil && tok.ID != 0 {
+			_ = cfg.Tokens.RevokeProjectAccessToken(ctx, cfg.Owner, cfg.Repo, tok.ID)
+		}
+		rs.Phase = rotationPhaseFailed
+		rs.Error = "project access token creation returned no value"
+		state.Roles[string(rec.Name)] = rs
+		_ = writeRotationState(ctx, cfg.Client, cfg.Owner, cfg.Repo, state)
+		result.Failed = append(result.Failed, RoleProvisionFailure{
+			Role: rec.Name, Secret: secret, Reason: rs.Error,
+		})
+		return
+	}
+	if !canMaskGitLabValue(tok.Token) {
+		_ = cfg.Tokens.RevokeProjectAccessToken(ctx, cfg.Owner, cfg.Repo, tok.ID)
+		rs.Phase = rotationPhaseFailed
+		rs.Error = "replacement credential cannot be masked"
+		state.Roles[string(rec.Name)] = rs
+		_ = writeRotationState(ctx, cfg.Client, cfg.Owner, cfg.Repo, state)
+		result.Failed = append(result.Failed, RoleProvisionFailure{
+			Role: rec.Name, Secret: secret, Reason: rs.Error,
+		})
+		return
+	}
+
+	outgoing := activeIDsExcept(matches, tok.ID)
+	if current.ID != 0 && current.ID != tok.ID {
+		outgoing = uniqueInts(append(outgoing, current.ID))
+	}
+	rs.Phase = rotationPhaseDistributing
+	rs.IncomingID = tok.ID
+	rs.OutgoingIDs = outgoing
+	rs.ExpiresAt = expiresAt
+	rs.Error = ""
+	state.Roles[string(rec.Name)] = rs
+	if err := writeRotationState(ctx, cfg.Client, cfg.Owner, cfg.Repo, state); err != nil {
+		if revokeErr := cfg.Tokens.RevokeProjectAccessToken(ctx, cfg.Owner, cfg.Repo, tok.ID); revokeErr != nil {
+			result.Diagnostics = append(result.Diagnostics, fmt.Sprintf("%s: replacement PAT id %d left for cleanup after state failure", rec.Name, tok.ID))
+		}
+		result.Failed = append(result.Failed, RoleProvisionFailure{
+			Role: rec.Name, Secret: secret,
+			Reason: "recording distribution state failed; replacement was not distributed",
+		})
+		result.Diagnostics = append(result.Diagnostics, fmt.Sprintf("%s: replacement was not distributed because rotation state could not be recorded", rec.Name))
+		return
+	}
+
+	if err := cfg.Client.CreateRepoSecret(ctx, cfg.Owner, cfg.Repo, secret, tok.Token); err != nil {
+		if tok.ID != 0 {
+			if revErr := cfg.Tokens.RevokeProjectAccessToken(ctx, cfg.Owner, cfg.Repo, tok.ID); revErr != nil {
+				result.Diagnostics = append(result.Diagnostics, fmt.Sprintf(
+					"%s: replacement PAT id %d left for cleanup after failed distribution", rec.Name, tok.ID))
+			}
+		}
+		rs.Phase = rotationPhaseFailed
+		rs.IncomingID = 0
+		rs.Error = "storing replacement credential failed"
+		state.Roles[string(rec.Name)] = rs
+		_ = writeRotationState(ctx, cfg.Client, cfg.Owner, cfg.Repo, state)
+		result.RolledBack = append(result.RolledBack, rec.Name)
+		result.Failed = append(result.Failed, RoleProvisionFailure{
+			Role: rec.Name, Secret: secret,
+			Reason: "storing replacement credential failed; previous credential left in place",
+		})
+		return
+	}
+
+	*listed = append(*listed, ProjectAccessToken{
+		ID: tok.ID, Name: tokenName, Active: true, ExpiresAt: expiresAt,
+	})
+	rs.Phase = rotationPhaseOverlapping
+	if len(outgoing) == 0 {
+		rs.Phase = rotationPhaseIdle
+	}
+	rs.DistributedAt = now.Format(time.RFC3339)
+	rs.IncomingID = tok.ID
+	rs.OutgoingIDs = outgoing
+	rs.ExpiresAt = expiresAt
+	rs.Error = ""
+	state.Roles[string(rec.Name)] = rs
+	if err := writeRotationState(ctx, cfg.Client, cfg.Owner, cfg.Repo, state); err != nil {
+		result.Failed = append(result.Failed, RoleProvisionFailure{
+			Role: rec.Name, Secret: secret,
+			Reason: "recording completed distribution state failed; replacement remains active",
+		})
+		result.Diagnostics = append(result.Diagnostics, fmt.Sprintf("%s: replacement was distributed but completed rotation state could not be recorded", rec.Name))
+		return
+	}
+
+	result.Rotated = append(result.Rotated, rec.Name)
+	if len(outgoing) > 0 {
+		result.Overlapping = append(result.Overlapping, rec.Name)
+		result.Diagnostics = append(result.Diagnostics, fmt.Sprintf(
+			"%s: replacement distributed; previous credential remains usable for in-flight jobs until grace cleanup", rec.Name))
+	} else {
+		result.Diagnostics = append(result.Diagnostics, fmt.Sprintf("%s: replacement distributed (%s)", rec.Name, secret))
+	}
+}
+
+func rotateProvided(ctx context.Context, cfg RoleRotateConfig, rec gitlabroles.Registration, secret, provided string, now time.Time, matches []ProjectAccessToken, rs *rotationRoleState, result *RoleRotateResult) {
+	if !canMaskGitLabValue(provided) {
+		result.Failed = append(result.Failed, RoleProvisionFailure{
+			Role: rec.Name, Secret: secret,
+			Reason: "administrator-provided credential cannot be masked (must be a single line of at least 8 characters using GitLab's allowed charset)",
+		})
+		return
+	}
+	if cfg.DryRun {
+		result.Rotated = append(result.Rotated, rec.Name)
+		result.Diagnostics = append(result.Diagnostics, fmt.Sprintf("%s: would enroll replacement (%s)", rec.Name, secret))
+		return
+	}
+	if err := cfg.Client.CreateRepoSecret(ctx, cfg.Owner, cfg.Repo, secret, provided); err != nil {
+		rs.Phase = rotationPhaseFailed
+		rs.Error = "storing administrator-provided replacement failed"
+		result.Failed = append(result.Failed, RoleProvisionFailure{
+			Role: rec.Name, Secret: secret,
+			Reason: "storing administrator-provided replacement failed; previous credential left in place",
+		})
+		return
+	}
+	outgoing := activeIDsExcept(matches, 0)
+	rs.Phase = rotationPhaseIdle
+	if len(outgoing) > 0 {
+		rs.Phase = rotationPhaseOverlapping
+	}
+	rs.IncomingID = 0
+	rs.OutgoingIDs = outgoing
+	rs.DistributedAt = now.Format(time.RFC3339)
+	rs.ExpiresAt = ""
+	rs.Error = ""
+	result.Rotated = append(result.Rotated, rec.Name)
+	result.Diagnostics = append(result.Diagnostics, fmt.Sprintf(
+		"%s: enrolled administrator-provided replacement (%s); previous credentials remain during the grace period", rec.Name, secret))
+}
+
+func cleanupOutgoing(ctx context.Context, cfg RoleRotateConfig, rs *rotationRoleState, now time.Time, grace time.Duration, listed *[]ProjectAccessToken) bool {
+	if cfg.Tokens == nil || len(rs.OutgoingIDs) == 0 {
+		return false
+	}
+	// Only revoke previous PATs after a successful distribution and
+	// the in-flight grace period. An incomplete (distributing) attempt
+	// must not drop the last known-good token.
+	if rs.Phase != rotationPhaseOverlapping || rs.DistributedAt == "" {
+		return false
+	}
+	dist, err := time.Parse(time.RFC3339, rs.DistributedAt)
+	if err != nil || now.Before(dist.Add(grace)) {
+		return false
+	}
+	cleaned := false
+	remaining := make([]int, 0, len(rs.OutgoingIDs))
+	for _, id := range rs.OutgoingIDs {
+		if id == rs.IncomingID {
+			continue
+		}
+		if err := cfg.Tokens.RevokeProjectAccessToken(ctx, cfg.Owner, cfg.Repo, id); err != nil {
+			remaining = append(remaining, id)
+			continue
+		}
+		removeListedID(listed, id)
+		cleaned = true
+	}
+	rs.OutgoingIDs = remaining
+	if len(remaining) == 0 && rs.Phase == rotationPhaseOverlapping {
+		rs.Phase = rotationPhaseIdle
+	}
+	return cleaned
+}
+
+func recentlyDistributed(rs rotationRoleState, now time.Time) bool {
+	if rs.IncomingID == 0 || rs.DistributedAt == "" {
+		return false
+	}
+	dist, err := time.Parse(time.RFC3339, rs.DistributedAt)
+	if err != nil {
+		return false
+	}
+	return now.Sub(dist) >= 0 && now.Sub(dist) <= gitlabroles.IdempotentRotationWindow
+}
+
+func otherHoldsRotationLock(rs rotationRoleState, holder string, now time.Time) bool {
+	if rs.Holder == "" || rs.Holder == holder || rs.LockUntil == "" {
+		return false
+	}
+	until, err := time.Parse(time.RFC3339, rs.LockUntil)
+	if err != nil {
+		return false
+	}
+	return now.Before(until)
+}
+
+func lockGitLabRoleRotation(owner, repo string, role gitlabroles.Role) func() {
+	key := owner + "/" + repo + "/" + string(role)
+	v, _ := roleRotateLocks.LoadOrStore(key, &sync.Mutex{})
+	mu := v.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
+}
+
+func loadRotationState(ctx context.Context, client forge.Client, owner, repo string) (rotationStateFile, []string, error) {
+	out := rotationStateFile{Roles: map[string]rotationRoleState{}}
+	raw, exists, err := client.GetRepoVariable(ctx, owner, repo, forge.VarGitLabRoleRotation)
+	if err != nil {
+		return out, nil, err
+	}
+	if !exists || strings.TrimSpace(raw) == "" {
+		return out, nil, nil
+	}
+	dec := json.NewDecoder(bytes.NewReader([]byte(raw)))
+	dec.DisallowUnknownFields()
+	var file rotationStateFile
+	if err := dec.Decode(&file); err != nil {
+		return out, nil, fmt.Errorf("decode GitLab role rotation state: %w", err)
+	}
+	if file.Roles == nil {
+		file.Roles = map[string]rotationRoleState{}
+	}
+	for role, rs := range file.Roles {
+		for field, rawTime := range map[string]string{"lock_until": rs.LockUntil, "distributed_at": rs.DistributedAt, "expires_at": rs.ExpiresAt} {
+			if rawTime == "" {
+				continue
+			}
+			if _, err := time.Parse(time.RFC3339, rawTime); err != nil {
+				if field == "expires_at" {
+					if _, dayErr := time.Parse("2006-01-02", rawTime); dayErr == nil {
+						continue
+					}
+				}
+				return out, nil, fmt.Errorf("invalid GitLab role rotation state %s.%s: %w", role, field, err)
+			}
+		}
+	}
+	return file, nil, nil
+}
+
+func writeRotationState(ctx context.Context, client forge.Client, owner, repo string, file rotationStateFile) error {
+	if file.Roles == nil {
+		file.Roles = map[string]rotationRoleState{}
+	}
+	raw, err := json.Marshal(file)
+	if err != nil {
+		return err
+	}
+	return client.UpdateCIVariable(ctx, owner, repo, forge.VarGitLabRoleRotation, string(raw), true)
+}
+
+func snapshotsFrom(toks []ProjectAccessToken) []gitlabroles.TokenSnapshot {
+	out := make([]gitlabroles.TokenSnapshot, 0, len(toks))
+	for _, tok := range toks {
+		out = append(out, gitlabroles.TokenSnapshot{
+			ID:        tok.ID,
+			Name:      tok.Name,
+			Active:    tok.Active,
+			ExpiresAt: tok.ExpiresAt,
+			Revoked:   tok.Revoked,
+		})
+	}
+	return out
+}
+
+func tokensNamed(listed []ProjectAccessToken, name string) []ProjectAccessToken {
+	var out []ProjectAccessToken
+	for _, tok := range listed {
+		if tok.Name == name {
+			out = append(out, tok)
+		}
+	}
+	return out
+}
+
+func currentListed(matches []ProjectAccessToken) ProjectAccessToken {
+	var best ProjectAccessToken
+	var bestExp time.Time
+	bestHas := false
+	for _, tok := range matches {
+		if !tok.Active || tok.Revoked {
+			continue
+		}
+		exp, err := time.Parse("2006-01-02", strings.TrimSpace(tok.ExpiresAt))
+		if err != nil {
+			if best.ID == 0 || tok.ID > best.ID {
+				best = tok
+			}
+			continue
+		}
+		if !bestHas || exp.After(bestExp) {
+			best, bestExp, bestHas = tok, exp, true
+		}
+	}
+	return best
+}
+
+func activeIDsExcept(matches []ProjectAccessToken, except int) []int {
+	var ids []int
+	for _, tok := range matches {
+		if tok.Active && !tok.Revoked && tok.ID != except && tok.ID != 0 {
+			ids = append(ids, tok.ID)
+		}
+	}
+	return ids
+}
+
+func uniqueInts(ids []int) []int {
+	seen := make(map[int]struct{}, len(ids))
+	out := make([]int, 0, len(ids))
+	for _, id := range ids {
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
+}
+
+func removeListedID(listed *[]ProjectAccessToken, id int) {
+	if listed == nil {
+		return
+	}
+	out := (*listed)[:0]
+	for _, tok := range *listed {
+		if tok.ID == id {
+			tok.Active = false
+		}
+		out = append(out, tok)
+	}
+	*listed = out
+}
+
+func wantedRoles(roles []gitlabroles.Role, reg gitlabroles.Registry) map[gitlabroles.Role]struct{} {
+	if len(roles) == 0 {
+		return nil
+	}
+	out := make(map[gitlabroles.Role]struct{}, len(roles))
+	for _, r := range roles {
+		out[r] = struct{}{}
+	}
+	for changed := true; changed; {
+		changed = false
+		for role := range out {
+			rec, ok := reg.Lookup(role)
+			if !ok || rec.Credential.Kind != gitlabroles.CredentialReuse {
+				continue
+			}
+			if _, exists := out[rec.Credential.ReuseOf]; !exists {
+				out[rec.Credential.ReuseOf] = struct{}{}
+				changed = true
+			}
+		}
+	}
+	return out
+}
+
+func containsInt(values []int, want int) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func roleWanted(want map[gitlabroles.Role]struct{}, name gitlabroles.Role) bool {
+	if want == nil {
+		return true
+	}
+	_, ok := want[name]
+	return ok
+}
+
+func roleReportFrom(ctx context.Context, cfg RoleRotateConfig, rec gitlabroles.Registration, matches []ProjectAccessToken, now time.Time, lead time.Duration) gitlabroles.RoleReport {
+	present := map[string]bool{}
+	if rec.Credential.SecretName != "" {
+		exists, err := cfg.Client.RepoSecretExists(ctx, cfg.Owner, cfg.Repo, rec.Credential.SecretName)
+		if err == nil {
+			present[rec.Credential.SecretName] = exists
+		}
+	}
+	rep := gitlabroles.DiagnoseLifecycle(gitlabroles.ModeEnforced, present, cfg.Registry, snapshotsFrom(matches), now, lead)
+	for _, got := range rep.Roles {
+		if got.Name == rec.Name {
+			return got
+		}
+	}
+	return gitlabroles.RoleReport{
+		Name:       rec.Name,
+		Kind:       rec.Kind,
+		SecretName: rec.Credential.SecretName,
+		TokenName:  rec.Credential.TokenName,
+		ReuseOf:    rec.Credential.ReuseOf,
+		State:      gitlabroles.RoleStateUnconfigured,
+		Lifecycle:  gitlabroles.LifecycleUnconfigured,
+	}
+}
+
+func sortRoleLists(result *RoleRotateResult) {
+	sortRoles := func(s []gitlabroles.Role) {
+		sort.Slice(s, func(i, j int) bool { return s[i] < s[j] })
+	}
+	sortRoles(result.Rotated)
+	sortRoles(result.Skipped)
+	sortRoles(result.Reused)
+	sortRoles(result.Overlapping)
+	sortRoles(result.RolledBack)
+	sortRoles(result.Cleaned)
+	sortRoles(result.InProgress)
+}
+
+func secretLeakRotate(result RoleRotateResult) string {
+	needles := []string{"glpat-", "glptt-", "gldt-"}
+	check := func(s string) string {
+		lower := strings.ToLower(s)
+		for _, n := range needles {
+			if strings.Contains(lower, n) {
+				return n
+			}
+		}
+		return ""
+	}
+	if n := check(string(result.Mode)); n != "" {
+		return n
+	}
+	for _, d := range result.Diagnostics {
+		if n := check(d); n != "" {
+			return n
+		}
+	}
+	for _, f := range result.Failed {
+		if n := check(f.Reason); n != "" {
+			return n
+		}
+		if n := check(string(f.Role)); n != "" {
+			return n
+		}
+		if n := check(f.Secret); n != "" {
+			return n
+		}
+	}
+	for _, d := range result.Report.Diagnostics {
+		if n := check(d); n != "" {
+			return n
+		}
+	}
+	return ""
+}
+
+// EnrichGitLabRoleStatus re-runs DiagnoseLifecycle with a token
+// inventory so repos status can report expiry, revocation, and
+// overlapping replacements. tokens may be nil.
+func EnrichGitLabRoleStatus(ctx context.Context, client forge.Client, owner, repo string, tokens []ProjectAccessToken, now time.Time, status *RepoStatus) bool {
+	if status == nil || client == nil {
+		return false
+	}
+	mode, reg, present, err := LoadGitLabRoleState(ctx, client, owner, repo)
+	if err != nil {
+		return false
+	}
+	rep := gitlabroles.DiagnoseLifecycle(mode, present, reg, snapshotsFrom(tokens), now, gitlabroles.DefaultRotationLead)
+	status.GitLabRoleMode = string(rep.Mode)
+	status.GitLabRolesReady = rep.Ready
+	status.GitLabRolesPartial = rep.Partial
+	status.GitLabRoleDiagnostics = rep.Diagnostics
+	if !mode.RequiresRoleCredentials() {
+		return false
+	}
+	before := len(status.Drifts)
+	seen := make(map[string]struct{}, len(status.Drifts))
+	for _, d := range status.Drifts {
+		seen[d.Field] = struct{}{}
+	}
+	for _, rr := range rep.Roles {
+		switch rr.Lifecycle {
+		case gitlabroles.LifecycleExpired, gitlabroles.LifecycleRevoked:
+			field := "gitlab-role:" + string(rr.Name)
+			if _, ok := seen[field]; ok {
+				continue
+			}
+			status.Drifts = append(status.Drifts, Drift{
+				Field:    field,
+				Expected: "valid",
+				Actual:   string(rr.Lifecycle),
+			})
+		}
+	}
+	return len(status.Drifts) > before
+}

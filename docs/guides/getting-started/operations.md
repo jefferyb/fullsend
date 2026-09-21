@@ -44,6 +44,7 @@ fullsend repos install -f repos.yaml "$OWNER/$REPO" \
 | `FULLSEND_DISPATCH_SECRET` | CI/CD secret | HMAC secret for dispatch variables and poll-state documents; auto-provisioned by `repos install` | (generated) |
 | `FULLSEND_GITLAB_ROLE_MIGRATION` | CI/CD variable (protected, unmasked) | Role-credential migration gate (`disabled`, `migrating`, `rollback`, `enforced`). Fresh `repos install` writes `migrating`; existing installs stay unset/`disabled` until opted in. See [gitlab-role-credentials.md](../../contributing/gitlab-role-credentials.md) | `migrating` |
 | `FULLSEND_GITLAB_ROLE_REGISTRY` | CI/CD variable (protected, unmasked) | Administrator role registry (JSON references and policy, not secret values); empty means built-in roles only. Written by `repos install --gitlab-role-registry`. | `{"roles":[]}` |
+| `FULLSEND_GITLAB_ROLE_ROTATION` | CI/CD variable (protected, unmasked) | Per-role rotation state (lock, token IDs, expiry dates, phase). Never stores token values. Written by `repos install` during rotation. | `{"roles":{}}` |
 | `FULLSEND_GITLAB_POLLER_TOKEN` / `FULLSEND_GITLAB_ANALYST_TOKEN` / `FULLSEND_GITLAB_CODER_TOKEN` | CI/CD secret | Built-in role PATs provisioned by `repos install`. Absence is not a health failure while the gate is `disabled` or during partial `migrating`. | (masked) |
 | `OPENAI_API_KEY` | CI/CD variable (masked) | Opt-in static OpenAI API key when OpenAI WIF is unavailable; unused when the WIF trio is set | `sk-...` |
 
