@@ -249,11 +249,22 @@ func rotateOneRole(ctx context.Context, cfg RoleRotateConfig, rec gitlabroles.Re
 		// Claim via mergeRoleState (re-read immediately before writing)
 		// instead of writeRotationState of the state snapshot loaded
 		// above, so a sibling role's concurrent update landing between
-		// that load and this write is not silently reverted. The
-		// ownership check inside mergeRoleState is skipped here (empty
-		// holder) since this holder does not own the lock yet; the
-		// read-back verify below detects a concurrent winner.
-		if err := mergeRoleState(ctx, cfg.Client, cfg.Owner, cfg.Repo, rec.Name, "", now, rs, &state); err != nil {
+		// that load and this write is not silently reverted. Passing
+		// holder (not empty) here lets mergeRoleState's own
+		// otherHoldsRotationLock check reject this claim against the
+		// freshly re-read document when a different, still-valid holder
+		// already owns the lock -- including one that claimed and
+		// advanced this same role (e.g. to distributing/overlapping)
+		// after this holder's own pre-claim read above. Without that
+		// check, this write would persist this holder's stale pre-claim
+		// snapshot on top of that in-progress or completed state and
+		// steal the lock.
+		if err := mergeRoleState(ctx, cfg.Client, cfg.Owner, cfg.Repo, rec.Name, holder, now, rs, &state); err != nil {
+			if errors.Is(err, errRotationLockLost) {
+				result.InProgress = append(result.InProgress, rec.Name)
+				result.Diagnostics = append(result.Diagnostics, fmt.Sprintf("%s: concurrent rotation won the lock; skipping", rec.Name))
+				return
+			}
 			result.Failed = append(result.Failed, RoleProvisionFailure{
 				Role: rec.Name, Secret: secret, Reason: "writing rotation lock failed",
 			})

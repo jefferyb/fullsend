@@ -601,6 +601,68 @@ func TestRotateGitLabRoleCredentials_ConcurrentSiblingRoleSurvivesLockClaim(t *t
 	assert.Equal(t, "2026-09-20T00:00:00Z", analyst.DistributedAt)
 }
 
+// staleClaimInjector simulates a second process that read an unlocked
+// rotation-state document, stalled, and only resumes its own lock claim
+// after a distinct-holder winner has already claimed the lock and
+// advanced the same role to a distributing (in-progress) state. It
+// injects the winner's write immediately after this process's first
+// read (loadRotationState in rotateOneRole, before the early
+// otherHoldsRotationLock check and before the lock-claim write), so the
+// stale claim's own re-read inside mergeRoleState observes it.
+type staleClaimInjector struct {
+	*forge.FakeClient
+	injected bool
+}
+
+func (c *staleClaimInjector) GetRepoVariable(ctx context.Context, owner, repo, name string) (string, bool, error) {
+	raw, exists, err := c.FakeClient.GetRepoVariable(ctx, owner, repo, name)
+	if name != forge.VarGitLabRoleRotation || c.injected {
+		return raw, exists, err
+	}
+	c.injected = true
+	file, _, loadErr := loadRotationState(ctx, c.FakeClient, owner, repo)
+	if loadErr == nil {
+		file.Roles[string(gitlabroles.RolePoller)] = rotationRoleState{
+			Phase:         rotationPhaseDistributing,
+			Holder:        "winner",
+			LockUntil:     "2026-09-21T13:00:00Z",
+			IncomingID:    99,
+			OutgoingIDs:   []int{7},
+			DistributedAt: "2026-09-21T11:59:00Z",
+			ExpiresAt:     "2026-10-01",
+		}
+		_ = writeRotationState(ctx, c.FakeClient, owner, repo, file)
+	}
+	return raw, exists, err
+}
+
+func TestRotateGitLabRoleCredentials_StaleClaimRejectedAfterConcurrentWinner(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 9, 21, 12, 0, 0, 0, time.UTC)
+	inner := seededRoleClient(t, gitlabroles.RolePoller)
+	fc := &staleClaimInjector{FakeClient: inner}
+	tokens := &fakeTokens{}
+	tokens.seed(ProjectAccessToken{Name: gitlabroles.PollerTokenName, Active: true, ExpiresAt: "2026-10-01"})
+
+	result, err := RotateGitLabRoleCredentials(context.Background(), RoleRotateConfig{
+		Owner: "group", Repo: "project", Client: fc, Tokens: tokens,
+		Registry: gitlabroles.BuiltinRegistry(), Mode: gitlabroles.ModeMigrating,
+		Roles: []gitlabroles.Role{gitlabroles.RolePoller}, Now: now, Holder: "self",
+	})
+	require.NoError(t, err)
+	require.True(t, fc.injected, "the winner's write must have landed for this test to be meaningful")
+	assert.Equal(t, []gitlabroles.Role{gitlabroles.RolePoller}, result.InProgress,
+		"the stale claim must lose to the concurrent winner instead of stealing its lock")
+	assert.Empty(t, tokens.created, "the stale claim must not mint a second replacement")
+
+	final, _, err := loadRotationState(context.Background(), inner, "group", "project")
+	require.NoError(t, err)
+	poller := final.Roles[string(gitlabroles.RolePoller)]
+	assert.Equal(t, "winner", poller.Holder, "the stale claim must not overwrite the winner's held lock")
+	assert.Equal(t, 99, poller.IncomingID, "the winner's incoming_id must survive the stale claim")
+	assert.Equal(t, []int{7}, poller.OutgoingIDs, "the winner's outgoing_ids must survive the stale claim")
+}
+
 func TestRotateGitLabRoleCredentials_InProgressLock(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, 9, 21, 12, 0, 0, 0, time.UTC)

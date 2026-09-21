@@ -402,9 +402,13 @@ revoked and the previous CI secret is left in place. Concurrent
 attempts for the same role are serialized (in-process lock plus a
 protected rotation-state document) and idempotent within a five-minute
 window: a retry adopts the already-distributed replacement rather than
-minting another. A crash after create but before store is recovered by
-revoking the orphan incoming PAT (its value is only returned at
-creation) and minting a fresh one.
+minting another. A crash after create where distribution is unproven
+(state stuck at `distributing`/`failed` with an incoming ID) is
+recovered by treating that incoming PAT as possibly the live CI
+secret: it is never revoked immediately, but kept in the outgoing set,
+the phase is marked `failed`, and a fresh replacement is minted and
+distributed. The preserved token is revoked only after the normal
+24-hour grace, once the new replacement is confirmed distributed.
 
 **No silent shared-token fallback.** Rotation never writes
 `FULLSEND_FORGE_TOKEN` and never selects the shared credential because
