@@ -768,6 +768,73 @@ func recordInitialDistribution(ctx context.Context, client forge.Client, owner, 
 	return mergeRoleState(ctx, client, owner, repo, role, "", now, rs, &state)
 }
 
+// backfillInitialDistributionProof records rotation-state distribution
+// proof for a role whose secret was already present before this
+// provisioning run (the present[secret] skip path in provisionOwnRoles),
+// but only when the role has no rotation-state entry yet. Without this,
+// a role provisioned before rotation-state tracking existed (the
+// pre-#7500 #7498 path) is indistinguishable from a crash orphan: the
+// first RotateGitLabRoleCredentials run against it would mint a
+// replacement for every such role even though DiagnoseLifecycle reports
+// it healthy.
+//
+// When a live PAT matching this role's token name can be listed, its ID
+// and expiry are recorded as proof, mirroring the freshly-minted-PAT
+// path in provisionOwnRoles. When no token client is configured at all
+// (for example free-tier enrollment, where project access tokens cannot
+// be created or listed via the API), an idle/IncomingID=0/DistributedAt
+// proof is recorded instead, mirroring the administrator-provided-
+// credential path, since no GitLab token ID can ever be resolved in that
+// setup. When a token client *is* configured but lists no PAT matching
+// this role's token name, the credential is left unproven: that is a
+// genuinely unverified state (the secret exists but nothing backs it),
+// not a healthy pre-existing token missing only its proof, and it must
+// stay eligible for the normal due-for-rotation handling rather than
+// being fabricated into a false "proven" state.
+//
+// An existing rotation-state entry for the role is left untouched -- it
+// may reflect a genuine in-progress or due state that this backfill must
+// never overwrite. Failure to read state or list tokens is non-fatal: it
+// only adds a diagnostic, since the secret itself is already present.
+func backfillInitialDistributionProof(ctx context.Context, cfg RoleProvisionConfig, rec gitlabroles.Registration, now time.Time, result *RoleProvisionResult) {
+	state, _, err := loadRotationState(ctx, cfg.Client, cfg.Owner, cfg.Repo)
+	if err != nil {
+		result.Diagnostics = append(result.Diagnostics, fmt.Sprintf(
+			"%s: reading rotation state to backfill distribution proof failed; a future rotation run may treat this pre-existing credential as unproven and replace it", rec.Name))
+		return
+	}
+	if _, exists := state.Roles[string(rec.Name)]; exists {
+		return
+	}
+	tokenID := 0
+	expiresAt := ""
+	if cfg.Tokens != nil {
+		toks, err := cfg.Tokens.ListProjectAccessTokens(ctx, cfg.Owner, cfg.Repo)
+		if err != nil {
+			result.Diagnostics = append(result.Diagnostics, fmt.Sprintf(
+				"%s: listing GitLab project access tokens to backfill distribution proof failed; a future rotation run may treat this pre-existing credential as unproven and replace it", rec.Name))
+			return
+		}
+		tokenName := rec.Credential.TokenName
+		if tokenName == "" {
+			tokenName = gitlabroles.CustomTokenName(rec.Name)
+		}
+		current := currentListed(tokensNamed(toks, tokenName))
+		if current.ID == 0 {
+			// No live PAT backs this secret: a genuinely unverified
+			// credential, not a healthy one merely missing its proof.
+			// Leave it unproven for the normal due-for-rotation checks.
+			return
+		}
+		tokenID = current.ID
+		expiresAt = current.ExpiresAt
+	}
+	if err := recordInitialDistribution(ctx, cfg.Client, cfg.Owner, cfg.Repo, rec.Name, tokenID, expiresAt, now); err != nil {
+		result.Diagnostics = append(result.Diagnostics, fmt.Sprintf(
+			"%s: recording rotation-state distribution proof failed; a future rotation run will treat this credential as unproven and replace it", rec.Name))
+	}
+}
+
 func snapshotsFrom(toks []ProjectAccessToken) []gitlabroles.TokenSnapshot {
 	out := make([]gitlabroles.TokenSnapshot, 0, len(toks))
 	for _, tok := range toks {

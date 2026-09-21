@@ -231,6 +231,9 @@ func provisionOwnRoles(ctx context.Context, cfg RoleProvisionConfig, reg gitlabr
 		secret := rec.Credential.SecretName
 		if present[secret] {
 			result.Skipped = append(result.Skipped, rec.Name)
+			if !cfg.DryRun {
+				backfillInitialDistributionProof(ctx, cfg, rec, now, result)
+			}
 			continue
 		}
 		if provided := strings.TrimSpace(cfg.ProvidedTokens[rec.Name]); provided != "" {

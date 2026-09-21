@@ -2,6 +2,7 @@ package repos
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -259,6 +260,227 @@ func TestProvisionGitLabRoleCredentials_RetrySkipsPresent(t *testing.T) {
 	assert.Equal(t, []gitlabroles.Role{gitlabroles.RoleAnalyst}, result.Created)
 	assert.Equal(t, []string{gitlabroles.AnalystTokenName}, tokens.createdNames())
 	assert.Empty(t, tokens.revoked)
+}
+
+func TestProvisionGitLabRoleCredentials_BackfillsProofForAlreadyPresentSecret(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fc := provisionClient(t)
+	// Simulate a repo provisioned before rotation-state tracking existed
+	// (the pre-#7500 #7498 path): all three built-in secrets are already
+	// present, but no FULLSEND_GITLAB_ROLE_ROTATION entry exists for any
+	// of them. Only poller has a live, listable PAT; analyst and coder
+	// have none, so they remain genuinely unverified rather than getting
+	// a fabricated proof.
+	fc.Secrets["group/project/"+forge.SecretGitLabPollerToken] = true
+	fc.Secrets["group/project/"+forge.SecretGitLabAnalystToken] = true
+	fc.Secrets["group/project/"+forge.SecretGitLabCoderToken] = true
+	tokens := &fakeTokens{}
+	tokens.seed(ProjectAccessToken{ID: 7, Name: gitlabroles.PollerTokenName, Active: true, ExpiresAt: "2027-01-02"})
+	now := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
+
+	result, err := ProvisionGitLabRoleCredentials(ctx, RoleProvisionConfig{
+		Owner:    "group",
+		Repo:     "project",
+		Client:   fc,
+		Tokens:   tokens,
+		Registry: gitlabroles.BuiltinRegistry(),
+		Now:      now,
+	})
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []gitlabroles.Role{
+		gitlabroles.RolePoller, gitlabroles.RoleAnalyst, gitlabroles.RoleCoder,
+	}, result.Skipped)
+	assert.Empty(t, tokens.createdNames())
+
+	raw := fc.VariableValues["group/project/"+forge.VarGitLabRoleRotation]
+	var state rotationStateFile
+	require.NoError(t, json.Unmarshal([]byte(raw), &state))
+
+	poller := state.Roles["poller"]
+	assert.Equal(t, rotationPhaseIdle, poller.Phase)
+	assert.Equal(t, 7, poller.IncomingID)
+	assert.Equal(t, "2026-01-02T00:00:00Z", poller.DistributedAt)
+	assert.Equal(t, "2027-01-02", poller.ExpiresAt)
+
+	// analyst/coder have no live PAT matching their token name, so no
+	// proof is fabricated for them -- they remain unproven/unverified.
+	for _, name := range []string{"analyst", "coder"} {
+		_, exists := state.Roles[name]
+		assert.False(t, exists, "role %s should not get a fabricated proof entry", name)
+	}
+
+	// A later rotation run must not treat poller's backfilled, healthy
+	// credential as an unproven orphan and re-mint a replacement, but
+	// analyst/coder are genuinely unverified (secret present, no matching
+	// PAT) and must still be rotated.
+	rotateResult, err := RotateGitLabRoleCredentials(ctx, RoleRotateConfig{
+		Owner:    "group",
+		Repo:     "project",
+		Client:   fc,
+		Tokens:   tokens,
+		Registry: gitlabroles.BuiltinRegistry(),
+		Mode:     gitlabroles.ModeEnforced,
+		Now:      now,
+	})
+	require.NoError(t, err)
+	assert.NotContains(t, rotateResult.Rotated, gitlabroles.RolePoller)
+	assert.NotContains(t, tokens.createdNames(), gitlabroles.PollerTokenName)
+	assert.ElementsMatch(t, []gitlabroles.Role{gitlabroles.RoleAnalyst, gitlabroles.RoleCoder}, rotateResult.Rotated)
+}
+
+func TestProvisionGitLabRoleCredentials_BackfillsIdleProofWithoutTokenClient(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fc := provisionClient(t)
+	// Free-tier enrollment: the secret is already present from an
+	// administrator-provided credential, and no token client exists to
+	// list or create project access tokens at all.
+	fc.Secrets["group/project/"+forge.SecretGitLabPollerToken] = true
+	now := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
+
+	result, err := ProvisionGitLabRoleCredentials(ctx, RoleProvisionConfig{
+		Owner:          "group",
+		Repo:           "project",
+		Client:         fc,
+		Registry:       gitlabroles.BuiltinRegistry(),
+		ProvidedTokens: map[gitlabroles.Role]string{gitlabroles.RoleAnalyst: "administrator-analyst-token"},
+		Now:            now,
+	})
+	require.NoError(t, err)
+	assert.Contains(t, result.Skipped, gitlabroles.RolePoller)
+
+	raw := fc.VariableValues["group/project/"+forge.VarGitLabRoleRotation]
+	var state rotationStateFile
+	require.NoError(t, json.Unmarshal([]byte(raw), &state))
+	poller := state.Roles["poller"]
+	assert.Equal(t, rotationPhaseIdle, poller.Phase)
+	assert.Equal(t, 0, poller.IncomingID)
+	assert.Equal(t, "2026-01-02T00:00:00Z", poller.DistributedAt)
+	assert.Empty(t, poller.ExpiresAt)
+}
+
+func TestProvisionGitLabRoleCredentials_BackfillSkipsExistingRotationState(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fc := provisionClient(t)
+	fc.Secrets["group/project/"+forge.SecretGitLabPollerToken] = true
+	tokens := &fakeTokens{}
+	tokens.seed(ProjectAccessToken{ID: 9, Name: gitlabroles.PollerTokenName, Active: true, ExpiresAt: "2027-01-02"})
+	// A genuine in-progress recovery state already exists for poller.
+	// The backfill must never overwrite it with a fresh idle entry.
+	require.NoError(t, fc.UpdateCIVariable(ctx, "group", "project", forge.VarGitLabRoleRotation,
+		`{"roles":{"poller":{"phase":"distributing","incoming_id":9,"outgoing_ids":[5],"distributed_at":"2025-01-01T00:00:00Z"}}}`, true))
+
+	_, err := ProvisionGitLabRoleCredentials(ctx, RoleProvisionConfig{
+		Owner:    "group",
+		Repo:     "project",
+		Client:   fc,
+		Tokens:   tokens,
+		Registry: gitlabroles.BuiltinRegistry(),
+		Now:      time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC),
+	})
+	require.NoError(t, err)
+
+	raw := fc.VariableValues["group/project/"+forge.VarGitLabRoleRotation]
+	var state rotationStateFile
+	require.NoError(t, json.Unmarshal([]byte(raw), &state))
+	poller := state.Roles["poller"]
+	assert.Equal(t, rotationPhaseDistributing, poller.Phase)
+	assert.Equal(t, []int{5}, poller.OutgoingIDs)
+	assert.Equal(t, "2025-01-01T00:00:00Z", poller.DistributedAt)
+}
+
+func TestProvisionGitLabRoleCredentials_DryRunDoesNotBackfillPresentSecret(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fc := provisionClient(t)
+	fc.Secrets["group/project/"+forge.SecretGitLabPollerToken] = true
+	tokens := &fakeTokens{}
+	tokens.seed(ProjectAccessToken{ID: 7, Name: gitlabroles.PollerTokenName, Active: true, ExpiresAt: "2027-01-02"})
+
+	result, err := ProvisionGitLabRoleCredentials(ctx, RoleProvisionConfig{
+		Owner:    "group",
+		Repo:     "project",
+		Client:   fc,
+		Tokens:   tokens,
+		Registry: gitlabroles.BuiltinRegistry(),
+		DryRun:   true,
+		Now:      time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC),
+	})
+	require.NoError(t, err)
+	assert.Contains(t, result.Skipped, gitlabroles.RolePoller)
+	assert.Empty(t, fc.UpdatedVariables)
+	_, exists := fc.VariableValues["group/project/"+forge.VarGitLabRoleRotation]
+	assert.False(t, exists)
+}
+
+func TestProvisionGitLabRoleCredentials_BackfillReadStateErrorIsNonFatal(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fc := provisionClient(t)
+	fc.Secrets["group/project/"+forge.SecretGitLabPollerToken] = true
+	fc.Secrets["group/project/"+forge.SecretGitLabAnalystToken] = true
+	fc.Secrets["group/project/"+forge.SecretGitLabCoderToken] = true
+	tokens := &fakeTokens{}
+	tokens.seed(ProjectAccessToken{ID: 7, Name: gitlabroles.PollerTokenName, Active: true, ExpiresAt: "2027-01-02"})
+	// Only the rotation-state read (loadRotationState) uses
+	// GetRepoVariable in this flow; the gate write path uses
+	// UpdateCIVariable, so this only breaks the backfill attempt, not
+	// provisioning as a whole.
+	fc.Errors["GetRepoVariable"] = fmt.Errorf("transient API failure")
+
+	result, err := ProvisionGitLabRoleCredentials(ctx, RoleProvisionConfig{
+		Owner:    "group",
+		Repo:     "project",
+		Client:   fc,
+		Tokens:   tokens,
+		Registry: gitlabroles.BuiltinRegistry(),
+		Now:      time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC),
+	})
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []gitlabroles.Role{
+		gitlabroles.RolePoller, gitlabroles.RoleAnalyst, gitlabroles.RoleCoder,
+	}, result.Skipped)
+	// A failed rotation-state read must not be surfaced as a secret leak
+	// or a hard failure -- the secrets themselves are already present and
+	// healthy; only the backfill proof is skipped.
+	assert.Empty(t, result.Failed)
+	for _, d := range result.Diagnostics {
+		assertNoLeak(t, d)
+	}
+}
+
+func TestProvisionGitLabRoleCredentials_BackfillListTokensErrorIsNonFatal(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fc := provisionClient(t)
+	fc.Secrets["group/project/"+forge.SecretGitLabPollerToken] = true
+	tokens := &fakeTokens{failList: fmt.Errorf("transient API failure")}
+
+	result, err := ProvisionGitLabRoleCredentials(ctx, RoleProvisionConfig{
+		Owner:    "group",
+		Repo:     "project",
+		Client:   fc,
+		Tokens:   tokens,
+		Registry: gitlabroles.BuiltinRegistry(),
+		Now:      time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC),
+	})
+	require.NoError(t, err)
+	assert.Contains(t, result.Skipped, gitlabroles.RolePoller)
+	assert.Empty(t, result.Failed)
+	for _, d := range result.Diagnostics {
+		assertNoLeak(t, d)
+	}
+
+	// Poller's own live inventory could not be checked, so no proof was
+	// recorded for it (unlike analyst/coder, created fresh in this same
+	// run via the normal create path, which do get proof).
+	raw := fc.VariableValues["group/project/"+forge.VarGitLabRoleRotation]
+	var state rotationStateFile
+	require.NoError(t, json.Unmarshal([]byte(raw), &state))
+	_, exists := state.Roles["poller"]
+	assert.False(t, exists, "no proof should be recorded for poller when its live inventory cannot be checked")
 }
 
 func TestProvisionGitLabRoleCredentials_RollbackDoesNotCreateOrDelete(t *testing.T) {

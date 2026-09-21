@@ -213,9 +213,11 @@ fullsend repos status --repo "acme/*" --json
 - **DRIFT** — Fields that differ from the manifest, scaffold files whose template content has changed, orphan files or variables no longer in the managed set, or `none`
 
 For GitLab repos, table and JSON output also include per-role credential
-lifecycle diagnostics (`ok`, `expiring`, `expired`, `revoked`,
-`unverified`, or `overlapping`). In enforced role-migration mode,
-expired or revoked role credentials are reported as `gitlab-role:<name>` drift.
+lifecycle diagnostic lines for roles needing attention (`expiring`,
+`expired`, `revoked`, `unverified`, or `overlapping`); roles that are
+`ok` or `unconfigured` do not get a diagnostic line. In enforced
+role-migration mode, expired or revoked role credentials are reported
+as `gitlab-role:<name>` drift.
 
 **JSON output** (`--json`) returns the full `StatusResult` object with per-repo details and aggregate summary counts.
 

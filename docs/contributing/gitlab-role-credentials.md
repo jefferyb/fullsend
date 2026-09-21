@@ -430,13 +430,16 @@ confirm it is not the replacement and revoke it manually.
 GitLab user ID changes on replacement. Fullsend preserves the role
 name, token name (`fullsend-poller`, `fullsend-role-<name>`), CI
 variable, and capability set. Rotation state records the old and new
-token IDs (never secret values) so `repos status` can show the chain.
+token IDs (never secret values) for internal use by
+`RotateGitLabRoleCredentials`: serialization between runs, crash
+recovery, and grace-period revocation tracking during `repos install`.
+It is not read or displayed by `repos status`.
 
 **Diagnostics.** `DiagnoseLifecycle` classifies each role as `ok`,
 `expiring`, `expired`, `revoked`, `unverified`, `overlapping`, or
 `unconfigured`. `repos status` reports those names and, in `enforced`
-mode, treats expired and revoked credentials as drift. Lines carry
-secret *names*, dates, and token IDs only.
+mode, treats expired and revoked credentials as drift. Lines carry role
+names, secret names, and dates only.
 
 ## What this contract does not do
 
@@ -453,9 +456,8 @@ Leave these to the follow-up issues.
 ## Credential-routing security checklist
 
 Hold these four invariants when changing `internal/gitlabroles`, GitLab
-credential handling in `internal/cli`, or the remaining rollout stages
-([#7500](https://github.com/fullsend-ai/fullsend/issues/7500),
-[#7501](https://github.com/fullsend-ai/fullsend/issues/7501)). They are
+credential handling in `internal/cli`, or the remaining rollout stage
+([#7501](https://github.com/fullsend-ai/fullsend/issues/7501)). They are
 the review findings from [PR #7510](https://github.com/fullsend-ai/fullsend/pull/7510)
 (stage 3 routing). A later change that selects, stores, or hands a
 GitLab role credential to a child process can reintroduce any of them.
